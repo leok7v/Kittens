@@ -1,0 +1,12 @@
+.build/
+Build/
+.swiftpm/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcworkspace/xcshareddata/
+xcuserdata/
+DerivedData/
+*.wav
+*.o
+*.d
+.DS_Store
