@@ -261,46 +261,82 @@ def _permute_iofc_to_ifgo(t: torch.Tensor, dim: int = 0) -> torch.Tensor:
 
 
 class ONNXBidirLSTM(nn.Module):
-    """Bidirectional LSTM matching the DynamicQuantizeLSTM in the ONNX graph.
+    """Bidirectional LSTM with per-timestep mask support.
 
     Weights loaded from ONNX layout:
         W:  (num_dir, 4H, in)   (after WeightBag.dequant_lstm)
         R:  (num_dir, 4H, H)
         B:  (num_dir, 8H)  = [Wb | Rb] per direction
-    All in iofc gate order.
+    All in iofc gate order; permuted to ifgo for the cell below.
 
-    Output of forward matches the old onnx_lstm_forward: (seq, 2, batch, H).
+    When `mask` is supplied to forward(), state is frozen at pad timesteps —
+    necessary because otherwise the backward direction processes pad tokens
+    first and its bias terms drift the state even with zero input, corrupting
+    real-token outputs. See scripts/diagnose_lstm_leak.py.
+
+    Output shape matches the old nn.LSTM-wrapped version: (seq, 2, batch, H).
     """
 
     def __init__(self, W: torch.Tensor, R: torch.Tensor, B: torch.Tensor):
         super().__init__()
         num_dir, H4, in_size = W.shape
         H = H4 // 4
-        assert num_dir == 2, "this wrapper is bidirectional only"
-
+        assert num_dir == 2
         self.hidden_size = H
-        self.lstm = nn.LSTM(input_size=in_size, hidden_size=H,
-                            num_layers=1, bidirectional=True,
-                            batch_first=False)
-        # Per-direction weight assignment with iofc→ifgo permutation.
-        with torch.no_grad():
-            for d_idx, suffix in enumerate(("l0", "l0_reverse")):
-                wih = _permute_iofc_to_ifgo(W[d_idx])
-                whh = _permute_iofc_to_ifgo(R[d_idx])
-                wb = _permute_iofc_to_ifgo(B[d_idx][:4 * H])
-                rb = _permute_iofc_to_ifgo(B[d_idx][4 * H:])
-                getattr(self.lstm, f"weight_ih_{suffix}").copy_(wih)
-                getattr(self.lstm, f"weight_hh_{suffix}").copy_(whh)
-                getattr(self.lstm, f"bias_ih_{suffix}").copy_(wb)
-                getattr(self.lstm, f"bias_hh_{suffix}").copy_(rb)
+        self.input_size = in_size
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (seq, batch, in).
-        out, _ = self.lstm(x)  # out (seq, batch, 2H)
-        seq, batch, two_H = out.shape
-        H = two_H // 2
-        # Reshape (seq, batch, 2H) → (seq, 2, batch, H) to match MLX layout.
-        return out.view(seq, batch, 2, H).permute(0, 2, 1, 3).contiguous()
+        # Permute iofc → ifgo and store per-direction weights as buffers so
+        # tracing turns them into constants, not parameter lookups.
+        for d_idx, name in enumerate(("fwd", "bwd")):
+            self.register_buffer(f"W_{name}", _permute_iofc_to_ifgo(W[d_idx]).contiguous())
+            self.register_buffer(f"R_{name}", _permute_iofc_to_ifgo(R[d_idx]).contiguous())
+            wb = _permute_iofc_to_ifgo(B[d_idx][: 4 * H])
+            rb = _permute_iofc_to_ifgo(B[d_idx][4 * H :])
+            self.register_buffer(f"B_{name}", (wb + rb).contiguous())
+
+    def _step(self, x_t: torch.Tensor, h: torch.Tensor, c: torch.Tensor,
+              W: torch.Tensor, R: torch.Tensor, B: torch.Tensor
+              ) -> tuple[torch.Tensor, torch.Tensor]:
+        # x_t (B, I), h,c (B, H), W (4H, I), R (4H, H), B (4H,)
+        gates = x_t @ W.t() + h @ R.t() + B
+        H = h.shape[-1]
+        i = torch.sigmoid(gates[:, 0:H])
+        f = torch.sigmoid(gates[:, H : 2 * H])
+        g = torch.tanh(gates[:, 2 * H : 3 * H])
+        o = torch.sigmoid(gates[:, 3 * H : 4 * H])
+        c_new = f * c + i * g
+        h_new = o * torch.tanh(c_new)
+        return h_new, c_new
+
+    def forward(self, x: torch.Tensor,
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """x: (seq, batch, in).  mask: (seq, batch) float, 1=real, 0=pad."""
+        seq, batch, _ = x.shape
+        H = self.hidden_size
+        zero_h = x.new_zeros(batch, H)
+
+        def run_dir(reverse: bool, W, R, B):
+            h = zero_h
+            c = zero_h
+            outs: list[torch.Tensor] = []
+            rng = range(seq - 1, -1, -1) if reverse else range(seq)
+            for t in rng:
+                h_new, c_new = self._step(x[t], h, c, W, R, B)
+                if mask is not None:
+                    m = mask[t].unsqueeze(-1)  # (batch, 1)
+                    h = torch.where(m > 0, h_new, h)
+                    c = torch.where(m > 0, c_new, c)
+                else:
+                    h, c = h_new, c_new
+                outs.append(h)
+            if reverse:
+                outs.reverse()
+            return torch.stack(outs, dim=0)  # (seq, batch, H)
+
+        y_f = run_dir(False, self.W_fwd, self.R_fwd, self.B_fwd)
+        y_b = run_dir(True,  self.W_bwd, self.R_bwd, self.B_bwd)
+        # Match prior layout (seq, 2, batch, H).
+        return torch.stack([y_f, y_b], dim=1)
 
 
 def load_onnx_bidir_lstm(w: WeightBag, W_key: str, R_key: str, B_key: str
@@ -370,7 +406,8 @@ class BertStack(nn.Module):
         self.d_head = 64
         self.d_model = 768
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Batch is always 1; avoid reading input_ids.shape[0] (triggers
         # aten::Int nodes that break coremltools tracing).
         L = input_ids.size(1)
@@ -382,6 +419,14 @@ class BertStack(nn.Module):
         h = layer_norm_last(h, self.lnW, self.lnB, eps=1e-12)
         h = h @ self.mIn + self.mInB
 
+        # Build additive attention bias once: 0 for real, -1e9 for pad.
+        # Broadcasts against scores shape (1, n_head, L, L): need (1, 1, 1, L).
+        if attention_mask is not None:
+            att_bias = (1.0 - attention_mask) * -1e9
+            att_bias = att_bias.reshape(1, 1, 1, -1)
+        else:
+            att_bias = None
+
         nh = self.n_head
         dh = self.d_head
         D = self.d_model
@@ -390,6 +435,8 @@ class BertStack(nn.Module):
             k = (h @ self.kW + self.kB).reshape(1, -1, nh, dh).transpose(1, 2)
             v = (h @ self.vW + self.vB).reshape(1, -1, nh, dh).transpose(1, 2)
             scores = (q @ k.transpose(-1, -2)) / math.sqrt(dh)
+            if att_bias is not None:
+                scores = scores + att_bias
             attn = torch.softmax(scores, dim=-1)
             ctx = (attn @ v).transpose(1, 2).reshape(1, -1, D)
             att_out = ctx @ self.dW + self.dB
@@ -416,20 +463,25 @@ class PredictorTextEncoder(nn.Module):
         self.register_buffer("fc3W", w.f32("kmodel.predictor.text_encoder.lstms.3.fc.weight"))
         self.register_buffer("fc3B", w.f32("kmodel.predictor.text_encoder.lstms.3.fc.bias"))
 
-    def forward(self, bert_out_nlc: torch.Tensor, prosody_style: torch.Tensor) -> torch.Tensor:
-        # Build (1, L, 128) style broadcast without extracting L as an int —
-        # coremltools chokes on aten::Int(size) nodes.
+    def forward(self, bert_out_nlc: torch.Tensor, prosody_style: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         s_bcast = prosody_style.unsqueeze(1) + torch.zeros_like(bert_out_nlc[..., :128])
+
+        # mask for per-timestep LSTM state freezing.  shape (L, 1) to match
+        # the (L, 1, in) LSTM input layout.
+        lstm_mask = attention_mask.transpose(0, 1) if attention_mask is not None else None
 
         x = torch.cat([bert_out_nlc, s_bcast], dim=-1)
         xT = x.transpose(0, 1).contiguous()  # (L, 1, 256)
-        y = self.lstm0(xT)  # (L, 2, 1, 64)
+        y = self.lstm0(xT, mask=lstm_mask)
         y0 = y.permute(2, 0, 1, 3).reshape(1, -1, 128)
         y1 = ada_layer_norm(y0, prosody_style, self.fc1W, self.fc1B)
+        if attention_mask is not None:
+            y1 = y1 * attention_mask.unsqueeze(-1)
 
         x = torch.cat([y1, s_bcast], dim=-1)
         xT = x.transpose(0, 1).contiguous()
-        y = self.lstm2(xT)
+        y = self.lstm2(xT, mask=lstm_mask)
         y2 = y.permute(2, 0, 1, 3).reshape(1, -1, 128)
         return ada_layer_norm(y2, prosody_style, self.fc3W, self.fc3B)
 
@@ -446,8 +498,11 @@ class AcousticTextEncoder(nn.Module):
             self.register_buffer(f"ln{i}b", w.f32(f"kmodel.text_encoder.cnn.{i}.1.beta"))
         self.lstm = load_onnx_bidir_lstm(w, "onnx::LSTM_5652", "onnx::LSTM_5653", "onnx::LSTM_5651")
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x_nlc = F.embedding(input_ids[0], self.w_emb).unsqueeze(0)  # (1, L, 128)
+        if attention_mask is not None:
+            x_nlc = x_nlc * attention_mask.unsqueeze(-1)
         for i in range(2):
             cnnW = getattr(self, f"cnn{i}W")
             cnnB = getattr(self, f"cnn{i}B")
@@ -459,9 +514,12 @@ class AcousticTextEncoder(nn.Module):
             b = getattr(self, f"ln{i}b")
             x_nlc = layer_norm_last(x_nlc, g, b)
             x_nlc = F.leaky_relu(x_nlc, 0.2)
+            if attention_mask is not None:
+                x_nlc = x_nlc * attention_mask.unsqueeze(-1)
 
         xT = x_nlc.transpose(0, 1).contiguous()
-        y = self.lstm(xT)
+        lstm_mask = attention_mask.transpose(0, 1) if attention_mask is not None else None
+        y = self.lstm(xT, mask=lstm_mask)
         y_nlc = y.permute(2, 0, 1, 3).reshape(1, -1, 128)
         return y_nlc.transpose(1, 2)  # (1, 128, L)
 
@@ -935,24 +993,28 @@ class TextStage(nn.Module):
         self.register_buffer("dpB", w.bias("predictor.duration_proj.linear_layer"))
         self.acoustic = AcousticTextEncoder(w)
 
-    def forward(self, input_ids: torch.Tensor, style256: torch.Tensor
+    def forward(self, input_ids: torch.Tensor, style256: torch.Tensor,
+                attention_mask: torch.Tensor
                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         prosodic_style = style256[:, 128:256]
 
-        bert_out = self.bert(input_ids)
+        bert_out = self.bert(input_ids, attention_mask=attention_mask)
         prosody_in = bert_out @ self.beW + self.beB
-        prosody = self.pred_text(prosody_in, prosodic_style)
+        prosody = self.pred_text(prosody_in, prosodic_style,
+                                 attention_mask=attention_mask)
         s_bcast = prosodic_style.unsqueeze(1) + torch.zeros_like(prosody)
         prosody256 = torch.cat([prosody, s_bcast], dim=-1)
         prosody_ncl = prosody256.transpose(1, 2).contiguous()
 
         lstm_in = prosody_ncl.permute(2, 0, 1).contiguous()
-        dy = self.duration_lstm(lstm_in)
+        lstm_mask = attention_mask.transpose(0, 1)
+        dy = self.duration_lstm(lstm_in, mask=lstm_mask)
         lstm_out = dy.permute(2, 0, 1, 3).reshape(1, -1, 128)
         dur_logits = lstm_out @ self.dpW + self.dpB
         dur_sig = torch.sigmoid(dur_logits)
 
-        text_features_ncl = self.acoustic(input_ids)
+        text_features_ncl = self.acoustic(input_ids,
+                                          attention_mask=attention_mask)
         return prosody_ncl, text_features_ncl, dur_sig
 
 

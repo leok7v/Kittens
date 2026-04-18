@@ -63,7 +63,7 @@ def compare(label: str, a: np.ndarray, b: np.ndarray) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("-L", type=int, default=32)
+    ap.add_argument("-L", type=int, default=128)
     ap.add_argument("--voice", default="expr-voice-5-m")
     ap.add_argument("--safetensors", default="Sources/KittenTTS/Resources/nano/kitten_tts_nano_v0_8.safetensors")
     ap.add_argument("--voices", default="scripts/models/voices.npz")
@@ -86,14 +86,22 @@ def main():
     text_stage = TextStage(w).eval()
     gen_stage = GeneratorStage(w).eval()
 
+    # Full attention mask (no padding) for parity testing.
+    mask_np = np.ones((1, args.L), dtype=np.float32)
+    mask_t = torch.from_numpy(mask_np)
+
     with torch.no_grad():
         t0 = time.time()
-        p_t, tf_t, ds_t = text_stage(input_ids_t, style_t)
+        p_t, tf_t, ds_t = text_stage(input_ids_t, style_t, mask_t)
         ttext = time.time() - t0
 
     # CoreML TextStage.
     t0 = time.time()
-    text_out = text_ml.predict({"input_ids": input_ids_np, "style": style_np})
+    text_out = text_ml.predict({
+        "input_ids": input_ids_np,
+        "style": style_np,
+        "attention_mask": mask_np,
+    })
     ttext_ml = time.time() - t0
 
     # Find outputs by shape heuristic (coremltools renames outputs).
@@ -120,11 +128,11 @@ def main():
     align, n_frames = build_alignment(durs_t, args.L)
     print(f"nFrames={n_frames}")
 
-    # Expand. CoreML generator is fixed at N=32; pad/trim nFrames to 32 for testing.
-    gen_pkg = "scripts/models/kitten_generator_N32.mlpackage"
+    # Expand. CoreML generator is fixed at N=256; pad/trim nFrames to 256 for testing.
+    gen_pkg = "scripts/models/kitten_generator_N256.mlpackage"
     print(f"\nloading {gen_pkg}")
     gen_ml = ct.models.MLModel(gen_pkg)
-    target_nf = 32
+    target_nf = 256
 
     prosody_lr_np = p_ml @ align           # (1, 256, nFrames)
     text_lr_np = tf_ml @ align             # (1, 128, nFrames)

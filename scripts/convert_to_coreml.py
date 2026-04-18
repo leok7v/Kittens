@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Trace TextStage / GeneratorStage with sample inputs and run coremltools.
 
-Strategy:
-  * Trace at one representative shape first to prove the graph converts.
-  * Then enumerate shape buckets (L ∈ {16, 32, 64, 128} etc.) to avoid the
-    full dynamic-shape conversion cost.
+coremltools 9 flex shapes (RangeDim) convert successfully but fail at
+runtime for any L != the trace-time L (the BERT attention shapes get
+baked into MIL constants). So we produce one fixed-shape .mlpackage per
+bucket and let the Swift loader pick the smallest bucket >= real length.
 
-Run subcommand(s):
-    python convert_to_coreml.py text         # convert TextStage only
-    python convert_to_coreml.py generator    # convert GeneratorStage only
-    python convert_to_coreml.py both
+Usage:
+    python convert_to_coreml.py text      -L 64,128,256
+    python convert_to_coreml.py generator -N 128,256,512
+    python convert_to_coreml.py both      -L 128 -N 256
 """
 from __future__ import annotations
 
@@ -60,51 +60,51 @@ def _sample_style() -> torch.Tensor:
     return torch.from_numpy(v["expr-voice-5-m"][32:33].astype(np.float32))
 
 
-def convert_text_stage(L: int = 32, save: bool = True,
-                       flex: bool = False) -> None:
-    tag = f"flex_L{L}" if flex else f"L{L}"
-    print(f"=== TextStage {tag} ===")
+def convert_text_stage(L: int, save: bool = True, out_dir: Path = OUT_DIR) -> None:
+    print(f"=== TextStage L={L} ===")
     w = WeightBag.load("Sources/KittenTTS/Resources/nano/kitten_tts_nano_v0_8.safetensors")
     stage = TextStage(w).eval()
 
     input_ids = torch.randint(1, 170, (1, L), dtype=torch.long)
+    # Example mask: first half real, second half pad (exercises the mask path
+    # at trace time — the runtime mask will differ per call).
+    mask = torch.zeros(1, L, dtype=torch.float32)
+    mask[:, : max(1, L // 2)] = 1.0
     style = _sample_style()
 
     with torch.no_grad():
-        p, t, d = stage(input_ids, style)
-    print(f"  torch outputs: prosody_ncl={tuple(p.shape)} text_features={tuple(t.shape)} dur_sig={tuple(d.shape)}")
+        p, t, d = stage(input_ids, style, mask)
+    print(f"  torch outputs: prosody_ncl={tuple(p.shape)} "
+          f"text_features={tuple(t.shape)} dur_sig={tuple(d.shape)}")
 
     print("  tracing ...")
     with torch.no_grad():
-        traced = torch.jit.trace(stage, (input_ids, style), check_trace=False, strict=False)
+        traced = torch.jit.trace(stage, (input_ids, style, mask),
+                                 check_trace=False, strict=False)
 
-    print(f"  converting to Core ML (flex={flex}) ...")
-    if flex:
-        ids_shape = ct.Shape(shape=(1, ct.RangeDim(lower_bound=4, upper_bound=512, default=L)))
-    else:
-        ids_shape = input_ids.shape
+    print("  converting to Core ML ...")
     mlmodel = ct.convert(
         traced,
         inputs=[
-            ct.TensorType(name="input_ids", shape=ids_shape, dtype=np.int32),
+            ct.TensorType(name="input_ids", shape=input_ids.shape, dtype=np.int32),
             ct.TensorType(name="style", shape=style.shape, dtype=np.float32),
+            ct.TensorType(name="attention_mask", shape=mask.shape, dtype=np.float32),
         ],
         convert_to="mlprogram",
         minimum_deployment_target=ct.target.macOS15,
         compute_precision=ct.precision.FLOAT32,
     )
-    mlmodel.short_description = f"KittenTTS text stage ({tag})"
+    mlmodel.short_description = f"KittenTTS text stage (L={L}, masked)"
     if save:
-        out = OUT_DIR / f"kitten_text_{tag}.mlpackage"
+        out = out_dir / f"kitten_text_L{L}.mlpackage"
         mlmodel.save(str(out))
         print(f"  saved {out}")
     print()
 
 
-def convert_generator_stage(n_frames: int = 32, save: bool = True,
-                            flex: bool = False) -> None:
-    tag = f"flex_N{n_frames}" if flex else f"N{n_frames}"
-    print(f"=== GeneratorStage {tag} ===")
+def convert_generator_stage(n_frames: int, save: bool = True,
+                            out_dir: Path = OUT_DIR) -> None:
+    print(f"=== GeneratorStage N={n_frames} ===")
     w = WeightBag.load("Sources/KittenTTS/Resources/nano/kitten_tts_nano_v0_8.safetensors")
     stage = GeneratorStage(w).eval()
 
@@ -121,48 +121,51 @@ def convert_generator_stage(n_frames: int = 32, save: bool = True,
         traced = torch.jit.trace(stage, (prosody_lr, text_lr, style),
                                  check_trace=False, strict=False)
 
-    print(f"  converting to Core ML (flex={flex}) ...")
-    if flex:
-        nf_dim = ct.RangeDim(lower_bound=16, upper_bound=1024, default=n_frames)
-        p_shape = ct.Shape(shape=(1, 256, nf_dim))
-        t_shape = ct.Shape(shape=(1, 128, nf_dim))
-    else:
-        p_shape = prosody_lr.shape
-        t_shape = text_lr.shape
+    print("  converting to Core ML ...")
     mlmodel = ct.convert(
         traced,
         inputs=[
-            ct.TensorType(name="prosody_lr", shape=p_shape, dtype=np.float32),
-            ct.TensorType(name="text_lr",    shape=t_shape, dtype=np.float32),
-            ct.TensorType(name="style",      shape=style.shape, dtype=np.float32),
+            ct.TensorType(name="prosody_lr", shape=prosody_lr.shape, dtype=np.float32),
+            ct.TensorType(name="text_lr",    shape=text_lr.shape,    dtype=np.float32),
+            ct.TensorType(name="style",      shape=style.shape,      dtype=np.float32),
         ],
         convert_to="mlprogram",
         minimum_deployment_target=ct.target.macOS15,
         compute_precision=ct.precision.FLOAT32,
     )
-    mlmodel.short_description = f"KittenTTS generator stage ({tag})"
+    mlmodel.short_description = f"KittenTTS generator stage (N={n_frames})"
     if save:
-        out = OUT_DIR / f"kitten_generator_{tag}.mlpackage"
+        out = out_dir / f"kitten_generator_N{n_frames}.mlpackage"
         mlmodel.save(str(out))
         print(f"  saved {out}")
     print()
+
+
+def _parse_int_list(spec: str) -> list[int]:
+    return [int(x) for x in spec.split(",") if x.strip()]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("which", choices=["text", "generator", "both"],
                     default="both", nargs="?")
-    ap.add_argument("-L", type=int, default=32, help="L for TextStage bucket")
-    ap.add_argument("-N", type=int, default=32, help="nFrames for GeneratorStage bucket")
-    ap.add_argument("--flex", action="store_true",
-                    help="emit RangeDim flex shapes (L ∈ [4,512], N ∈ [16,1024])")
+    ap.add_argument("-L", default="128",
+                    help="TextStage bucket(s), comma-separated (e.g. '64,128,256')")
+    ap.add_argument("-N", default="256",
+                    help="GeneratorStage bucket(s), comma-separated")
+    ap.add_argument("--out", default=str(OUT_DIR), help="output directory")
     ap.add_argument("--no-save", action="store_true")
     args = ap.parse_args()
 
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     if args.which in ("text", "both"):
-        convert_text_stage(args.L, save=not args.no_save, flex=args.flex)
+        for L in _parse_int_list(args.L):
+            convert_text_stage(L, save=not args.no_save, out_dir=out_dir)
     if args.which in ("generator", "both"):
-        convert_generator_stage(args.N, save=not args.no_save, flex=args.flex)
+        for N in _parse_int_list(args.N):
+            convert_generator_stage(N, save=not args.no_save, out_dir=out_dir)
 
 
 if __name__ == "__main__":
