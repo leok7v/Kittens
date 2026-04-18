@@ -252,12 +252,32 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
         let wavFlat = try Self.copyToFloat32(wav)
         let realSamples = totalFrames * Self.audioPerFrame * 2
         let take = min(realSamples, wavFlat.count)
+        var output = Array(wavFlat.prefix(take))
+        // The model's last audio sample is whatever the generator happens to
+        // emit — not zero. Cutting mid-signal produces an audible click at
+        // chunk boundaries. Apply a 10 ms cosine fade-out so the final sample
+        // lands at ≈ 0 without perceptible change to the speech content.
+        Self.applyTailFade(&output, fadeSamples: 240)
         let generatorStageMs = Date().timeIntervalSince(tGenStart) * 1000.0
         onChunkMetrics?(ChunkMetrics(
             phonemes: realL, bucketL: L, bucketN: nBucket,
             textStageMs: textStageMs, generatorStageMs: generatorStageMs,
-            samples: take))
-        return Array(wavFlat.prefix(take))
+            samples: output.count))
+        return output
+    }
+
+    /// Cosine fade the last `fadeSamples` of `samples` from 1× down to 0.
+    /// Eliminates the click when the generator's tail sample is non-zero.
+    private static func applyTailFade(_ samples: inout [Float], fadeSamples: Int) {
+        let n = min(fadeSamples, samples.count)
+        guard n > 0 else { return }
+        let start = samples.count - n
+        for i in 0..<n {
+            // Half-cosine: 1 at i=0, 0 at i=n-1.
+            let t = Float(i) / Float(n - 1 > 0 ? n - 1 : 1)
+            let gain = 0.5 + 0.5 * cos(.pi * t)
+            samples[start + i] *= gain
+        }
     }
 
     /// Copy an MLMultiArray into a packed row-major Float32 array, regardless
