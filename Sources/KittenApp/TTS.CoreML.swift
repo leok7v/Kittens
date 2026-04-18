@@ -33,8 +33,10 @@ public final class KittenTTSCoreML: @unchecked Sendable {
         public let samples: Int
     }
 
-    /// Called every time a bucket is compiled on disk (first use only).
-    public var onBucketCompiled: ((_ name: String, _ elapsedMs: Double) -> Void)?
+    /// Called after a bucket is ready to use — for bundle-precompiled
+    /// `.mlmodelc`s this is just the MLModel load time; for `.mlpackage`s
+    /// it includes Apple's on-device compile cost.
+    public var onBucketLoaded: ((_ name: String, _ elapsedMs: Double) -> Void)?
     /// Called once per speak() chunk, after audio is produced.
     public var onChunkMetrics: ((ChunkMetrics) -> Void)?
 
@@ -61,6 +63,15 @@ public final class KittenTTSCoreML: @unchecked Sendable {
     public func preload() async throws {
         if !voiceEmbeds.isEmpty { return }
         try loadVoices()
+    }
+
+    /// Release all loaded MLModel buckets (voice table stays — it's 400 KB).
+    /// Call this when switching to another backend to free RAM.
+    public func unload() {
+        loadLock.lock()
+        textModels.removeAll()
+        generatorModels.removeAll()
+        loadLock.unlock()
     }
 
     public func speak(
@@ -320,7 +331,7 @@ public final class KittenTTSCoreML: @unchecked Sendable {
             let t0 = Date()
             let model = try MLModel(contentsOf: found.url, configuration: cfg)
             let elapsedMs = Date().timeIntervalSince(t0) * 1000.0
-            onBucketCompiled?("\(name) (precompiled)", elapsedMs)
+            onBucketLoaded?("\(name) (precompiled)", elapsedMs)
             return model
         }
         // Fallback: compile .mlpackage on first use, cache compiled bundle.
@@ -328,7 +339,7 @@ public final class KittenTTSCoreML: @unchecked Sendable {
         let compiledURL = try await Self.compiledModelURL(packageURL: found.url, name: name)
         let model = try MLModel(contentsOf: compiledURL, configuration: cfg)
         let elapsedMs = Date().timeIntervalSince(t0) * 1000.0
-        onBucketCompiled?(name, elapsedMs)
+        onBucketLoaded?(name, elapsedMs)
         return model
     }
 

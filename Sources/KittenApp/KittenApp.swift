@@ -190,7 +190,7 @@ struct KittenTTSView: View {
                         .frame(minHeight: 160, idealHeight: 220)
                         .background(Color.secondary.opacity(0.08))
                         .clipShape(RoundedRectangle(cornerRadius: 6))
-                        .onChange(of: log.entries.count) { _ in
+                        .onChange(of: log.entries.count) { _, _ in
                             if let last = log.entries.last {
                                 withAnimation(.linear(duration: 0.08)) {
                                     reader.scrollTo(last.id, anchor: .bottom)
@@ -203,6 +203,9 @@ struct KittenTTSView: View {
             .padding()
         }
         .task { await preloadModel() }
+        .onChange(of: backend) { _, newValue in
+            Task { await switchBackend(to: newValue) }
+        }
     }
 
     private static let timeFmt: DateFormatter = {
@@ -227,31 +230,11 @@ struct KittenTTSView: View {
         log.updateRAM()
         log.info("launch  RAM \(Int(log.ramMB)) MB")
 
-        // MLX preload.
-        let t0 = Date()
-        do {
-            try await mlxTTS.preload()
-            let ms = Date().timeIntervalSince(t0) * 1000
-            log.metric(String(format: "MLX    preload  %5.0f ms", ms))
-        } catch {
-            log.warn("MLX preload failed: \(error.localizedDescription)")
-        }
-
-        // CoreML voice-table preload (models compile lazily on first speak).
-        let t1 = Date()
-        do {
-            try await coreMLTTS.preload()
-            let ms = Date().timeIntervalSince(t1) * 1000
-            log.metric(String(format: "CoreML voices   %5.0f ms", ms))
-        } catch {
-            log.warn("CoreML preload failed: \(error.localizedDescription)")
-        }
-
-        // Hook metric callbacks.
-        coreMLTTS.onBucketCompiled = { [weak log] name, ms in
+        // Install metric callbacks once — they survive backend switches.
+        coreMLTTS.onBucketLoaded = { [weak log] name, ms in
             let msStr = String(format: "%5.0f", ms)
             Task { @MainActor in
-                log?.metric("CoreML compiled \(name.paddedRight(26)) \(msStr) ms")
+                log?.metric("CoreML loaded   \(name.paddedRight(26)) \(msStr) ms")
             }
         }
         coreMLTTS.onChunkMetrics = { [weak log] m in
@@ -275,8 +258,52 @@ struct KittenTTSView: View {
             }
         }
 
+        // Only the currently-selected backend is resident at any time.
+        await loadBackend(backend)
         modelReady = true
         status = "Ready"
+    }
+
+    /// Swap the active backend: drop the old one's memory, preload the new one.
+    private func switchBackend(to newBackend: Backend) async {
+        modelReady = false
+        status = "Switching to \(newBackend.rawValue)..."
+        await unloadBackend(newBackend == .mlx ? .coreml : .mlx)
+        await loadBackend(newBackend)
+        modelReady = true
+        status = "Ready"
+    }
+
+    private func loadBackend(_ b: Backend) async {
+        let tag = (b == .mlx ? "MLX" : "CoreML").paddedRight(6)
+        let ramBefore = KittenMetrics.residentMB()
+        let t0 = Date()
+        do {
+            switch b {
+            case .mlx:    try await mlxTTS.preload()
+            case .coreml: try await coreMLTTS.preload()
+            }
+            let ms = Date().timeIntervalSince(t0) * 1000
+            let ramAfter = KittenMetrics.residentMB()
+            log.metric(String(format: "\(tag) preload  %5.0f ms   RAM %.0f → %.0f MB",
+                              ms, ramBefore, ramAfter))
+        } catch {
+            log.warn("\(b.rawValue) preload failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func unloadBackend(_ b: Backend) async {
+        let tag = (b == .mlx ? "MLX" : "CoreML").paddedRight(6)
+        let ramBefore = KittenMetrics.residentMB()
+        switch b {
+        case .mlx:    mlxTTS.unload()
+        case .coreml: coreMLTTS.unload()
+        }
+        // Give autorelease pools a moment to actually drop the pages.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let ramAfter = KittenMetrics.residentMB()
+        log.metric(String(format: "\(tag) unload          RAM %.0f → %.0f MB",
+                          ramBefore, ramAfter))
     }
 
     private func generateAndStream() {

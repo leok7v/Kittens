@@ -75,6 +75,14 @@ public final class KittenTTS: @unchecked Sendable {
         }
     }
 
+    /// Release cached safetensors + voice arrays and flush the MLX cache.
+    /// Call this when switching to a different backend to free RAM.
+    public func unload() {
+        cachedWeights = nil
+        cachedVoices = nil
+        MLX.Memory.clearCache()
+    }
+
     private func loadWeightsIfNeeded(modelPath: String? = nil) throws -> (Weights, [String: MLXArray]) {
         if let w = cachedWeights, let v = cachedVoices { return (w, v) }
 
