@@ -2,6 +2,11 @@ import SwiftUI
 import Combine
 import MLX
 import AVFoundation
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
 
 @main
 struct KittenApp: App {
@@ -209,11 +214,15 @@ struct KittenTTSView: View {
 
                 Text(status).font(.caption).foregroundColor(.secondary)
 
-                // Metrics log pane.
+                // Metrics log pane — selectable text, plus a "Copy" button
+                // for quick paste into investigation notes / AI sessions.
                 VStack(alignment: .leading, spacing: 0) {
                     HStack {
                         Text("Log").font(.caption.bold())
                         Spacer()
+                        Button("Copy") { copyLogToPasteboard() }
+                            .font(.caption)
+                            .disabled(log.entries.isEmpty)
                         Button("Clear") { log.entries.removeAll() }
                             .font(.caption)
                     }
@@ -228,6 +237,7 @@ struct KittenTTSView: View {
                                         .foregroundColor(color(for: e.kind))
                                         .id(e.id)
                                         .frame(maxWidth: .infinity, alignment: .leading)
+                                        .textSelection(.enabled)
                                 }
                             }
                             .padding(6)
@@ -270,6 +280,16 @@ struct KittenTTSView: View {
 
     private func format(_ e: LogEntry) -> String {
         "\(Self.timeFmt.string(from: e.time))  \(e.text)"
+    }
+
+    private func copyLogToPasteboard() {
+        let text = log.entries.map(format).joined(separator: "\n")
+        #if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #else
+        UIPasteboard.general.string = text
+        #endif
     }
 
     private func color(for kind: LogEntry.Kind) -> Color {
