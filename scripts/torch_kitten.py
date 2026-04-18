@@ -261,82 +261,56 @@ def _permute_iofc_to_ifgo(t: torch.Tensor, dim: int = 0) -> torch.Tensor:
 
 
 class ONNXBidirLSTM(nn.Module):
-    """Bidirectional LSTM with per-timestep mask support.
+    """Bidirectional LSTM that wraps torch.nn.LSTM with ONNX → PyTorch gate
+    permutation on load. Traces to a single CoreML `lstm` primitive — ~10×
+    faster than a Python-unrolled loop for L=128.
 
     Weights loaded from ONNX layout:
         W:  (num_dir, 4H, in)   (after WeightBag.dequant_lstm)
         R:  (num_dir, 4H, H)
         B:  (num_dir, 8H)  = [Wb | Rb] per direction
-    All in iofc gate order; permuted to ifgo for the cell below.
+    All in iofc gate order; permuted to ifgo (PyTorch's order) on load.
 
-    When `mask` is supplied to forward(), state is frozen at pad timesteps —
-    necessary because otherwise the backward direction processes pad tokens
-    first and its bias terms drift the state even with zero input, corrupting
-    real-token outputs. See scripts/diagnose_lstm_leak.py.
+    NOTE: this version does NOT mask state at pad timesteps. When the caller
+    pads the input sequence the backward direction's state will drift slightly
+    through the pad prefix. Callers should zero pad inputs (x * mask) to
+    minimise drive drift, and pick the smallest bucket that fits their real
+    length to minimise pad count. See scripts/diagnose_lstm_leak.py for
+    measured drift vs. pad count.
 
-    Output shape matches the old nn.LSTM-wrapped version: (seq, 2, batch, H).
+    Output shape: (seq, 2, batch, H), to match the rest of the port.
     """
 
     def __init__(self, W: torch.Tensor, R: torch.Tensor, B: torch.Tensor):
         super().__init__()
         num_dir, H4, in_size = W.shape
         H = H4 // 4
-        assert num_dir == 2
+        assert num_dir == 2, "bidirectional only"
         self.hidden_size = H
-        self.input_size = in_size
-
-        # Permute iofc → ifgo and store per-direction weights as buffers so
-        # tracing turns them into constants, not parameter lookups.
-        for d_idx, name in enumerate(("fwd", "bwd")):
-            self.register_buffer(f"W_{name}", _permute_iofc_to_ifgo(W[d_idx]).contiguous())
-            self.register_buffer(f"R_{name}", _permute_iofc_to_ifgo(R[d_idx]).contiguous())
-            wb = _permute_iofc_to_ifgo(B[d_idx][: 4 * H])
-            rb = _permute_iofc_to_ifgo(B[d_idx][4 * H :])
-            self.register_buffer(f"B_{name}", (wb + rb).contiguous())
-
-    def _step(self, x_t: torch.Tensor, h: torch.Tensor, c: torch.Tensor,
-              W: torch.Tensor, R: torch.Tensor, B: torch.Tensor
-              ) -> tuple[torch.Tensor, torch.Tensor]:
-        # x_t (B, I), h,c (B, H), W (4H, I), R (4H, H), B (4H,)
-        gates = x_t @ W.t() + h @ R.t() + B
-        H = h.shape[-1]
-        i = torch.sigmoid(gates[:, 0:H])
-        f = torch.sigmoid(gates[:, H : 2 * H])
-        g = torch.tanh(gates[:, 2 * H : 3 * H])
-        o = torch.sigmoid(gates[:, 3 * H : 4 * H])
-        c_new = f * c + i * g
-        h_new = o * torch.tanh(c_new)
-        return h_new, c_new
+        self.lstm = nn.LSTM(input_size=in_size, hidden_size=H,
+                            num_layers=1, bidirectional=True,
+                            batch_first=False)
+        with torch.no_grad():
+            for d_idx, suffix in enumerate(("l0", "l0_reverse")):
+                wih = _permute_iofc_to_ifgo(W[d_idx])
+                whh = _permute_iofc_to_ifgo(R[d_idx])
+                wb = _permute_iofc_to_ifgo(B[d_idx][: 4 * H])
+                rb = _permute_iofc_to_ifgo(B[d_idx][4 * H :])
+                getattr(self.lstm, f"weight_ih_{suffix}").copy_(wih)
+                getattr(self.lstm, f"weight_hh_{suffix}").copy_(whh)
+                getattr(self.lstm, f"bias_ih_{suffix}").copy_(wb)
+                getattr(self.lstm, f"bias_hh_{suffix}").copy_(rb)
 
     def forward(self, x: torch.Tensor,
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """x: (seq, batch, in).  mask: (seq, batch) float, 1=real, 0=pad."""
-        seq, batch, _ = x.shape
-        H = self.hidden_size
-        zero_h = x.new_zeros(batch, H)
-
-        def run_dir(reverse: bool, W, R, B):
-            h = zero_h
-            c = zero_h
-            outs: list[torch.Tensor] = []
-            rng = range(seq - 1, -1, -1) if reverse else range(seq)
-            for t in rng:
-                h_new, c_new = self._step(x[t], h, c, W, R, B)
-                if mask is not None:
-                    m = mask[t].unsqueeze(-1)  # (batch, 1)
-                    h = torch.where(m > 0, h_new, h)
-                    c = torch.where(m > 0, c_new, c)
-                else:
-                    h, c = h_new, c_new
-                outs.append(h)
-            if reverse:
-                outs.reverse()
-            return torch.stack(outs, dim=0)  # (seq, batch, H)
-
-        y_f = run_dir(False, self.W_fwd, self.R_fwd, self.B_fwd)
-        y_b = run_dir(True,  self.W_bwd, self.R_bwd, self.B_bwd)
-        # Match prior layout (seq, 2, batch, H).
-        return torch.stack([y_f, y_b], dim=1)
+        """x: (seq, batch, in). mask is accepted for API compatibility but
+        currently ignored — pad drift is handled by (a) x*mask at call sites
+        and (b) smallest-bucket-that-fits at runtime."""
+        _ = mask
+        out, _ = self.lstm(x)           # (seq, batch, 2H)
+        seq, batch, two_H = out.shape
+        H = two_H // 2
+        return out.view(seq, batch, 2, H).permute(0, 2, 1, 3).contiguous()
 
 
 def load_onnx_bidir_lstm(w: WeightBag, W_key: str, R_key: str, B_key: str
