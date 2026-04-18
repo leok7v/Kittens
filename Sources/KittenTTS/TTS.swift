@@ -43,6 +43,15 @@ public final class KittenTTS: @unchecked Sendable {
 
     public typealias SpeakCallback = (UnsafePointer<Int16>, Int) -> Void
 
+    /// Per-chunk runtime metrics. Same shape idea as KittenTTSCoreML.ChunkMetrics
+    /// but without bucket fields (MLX runs at the actual L / nFrames).
+    public struct ChunkMetrics: Sendable {
+        public let phonemes: Int
+        public let elapsedMs: Double
+        public let samples: Int
+    }
+    public var onChunkMetrics: ((ChunkMetrics) -> Void)?
+
     /// Copy bundled mlx.metallib next to the running binary so MLX's
     /// colocated-search finds it without any env vars or path hacks.
     private static var metalLibInstalled = false
@@ -113,6 +122,7 @@ public final class KittenTTS: @unchecked Sendable {
                 let refId = min(chunk.count, voiceEmbeds.dim(0) - 1)
                 let style = voiceEmbeds[refId...refId].reshaped([1, -1])
 
+                let tStart = Date()
                 let audio = kittenForward(
                     weights: weights,
                     inputIds: inputIds,
@@ -120,6 +130,11 @@ public final class KittenTTS: @unchecked Sendable {
                     speed: effectiveSpeed
                 )
                 let samples: [Float] = audio.asArray(Float.self)
+                let elapsedMs = Date().timeIntervalSince(tStart) * 1000.0
+                onChunkMetrics?(ChunkMetrics(
+                    phonemes: phonemes.count,
+                    elapsedMs: elapsedMs,
+                    samples: samples.count))
 
                 if let cb = callback {
                     let int16Samples = samples.map { Int16(clamping: Int(round($0 * 32767.0))) }

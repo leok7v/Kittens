@@ -23,6 +23,21 @@ public final class KittenTTSCoreML: @unchecked Sendable {
 
     public typealias SpeakCallback = (UnsafePointer<Int16>, Int) -> Void
 
+    /// Metrics emitted by the backend for UI / CLI display.
+    public struct ChunkMetrics: Sendable {
+        public let phonemes: Int
+        public let bucketL: Int
+        public let bucketN: Int
+        public let textStageMs: Double
+        public let generatorStageMs: Double
+        public let samples: Int
+    }
+
+    /// Called every time a bucket is compiled on disk (first use only).
+    public var onBucketCompiled: ((_ name: String, _ elapsedMs: Double) -> Void)?
+    /// Called once per speak() chunk, after audio is produced.
+    public var onChunkMetrics: ((ChunkMetrics) -> Void)?
+
     // Shipped bucket sizes. Keep sorted ascending.
     static let textBuckets: [Int] = [16, 32, 64, 128]
     static let generatorBuckets: [Int] = [128, 256, 512]
@@ -93,6 +108,7 @@ public final class KittenTTSCoreML: @unchecked Sendable {
         let L = Self.textBuckets.first(where: { $0 >= realL }) ?? Self.textBuckets.last!
         let clippedL = min(realL, L)
         let textModel = try await textBucket(L)
+        let tTextStart = Date()
 
         // 1. Build padded input_ids [1, L] int32 + attention_mask [1, L] float32.
         let idsArr = try MLMultiArray(shape: [1, NSNumber(value: L)], dataType: .int32)
@@ -140,6 +156,7 @@ public final class KittenTTSCoreML: @unchecked Sendable {
         let durSigFlat = try Self.copyToFloat32(durSig)
         let prosodyFlat = try Self.copyToFloat32(prosodyNCL)
         let textFlat = try Self.copyToFloat32(textFeatures)
+        let textStageMs = Date().timeIntervalSince(tTextStart) * 1000.0
 
         // 3. Compute durations from dur_sig for the real phonemes only.
         var durations: [Int] = []
@@ -169,6 +186,7 @@ public final class KittenTTSCoreML: @unchecked Sendable {
             totalFrames = durations.reduce(0, +)
         }
         let generatorModel = try await generatorBucket(nBucket)
+        let tGenStart = Date()
 
         // 5. Length regulation into [1, C, N].
         let prosodyLR = try MLMultiArray(shape: [1, 256, NSNumber(value: nBucket)], dataType: .float32)
@@ -211,6 +229,11 @@ public final class KittenTTSCoreML: @unchecked Sendable {
         let wavFlat = try Self.copyToFloat32(wav)
         let realSamples = totalFrames * Self.audioPerFrame * 2
         let take = min(realSamples, wavFlat.count)
+        let generatorStageMs = Date().timeIntervalSince(tGenStart) * 1000.0
+        onChunkMetrics?(ChunkMetrics(
+            phonemes: realL, bucketL: L, bucketN: nBucket,
+            textStageMs: textStageMs, generatorStageMs: generatorStageMs,
+            samples: take))
         return Array(wavFlat.prefix(take))
     }
 
@@ -288,8 +311,12 @@ public final class KittenTTSCoreML: @unchecked Sendable {
         let cfg = MLModelConfiguration()
         cfg.computeUnits = .all
         let packageURL = try Self.packageURL(name: "\(name).mlpackage")
+        let t0 = Date()
         let compiledURL = try await Self.compiledModelURL(packageURL: packageURL, name: name)
-        return try MLModel(contentsOf: compiledURL, configuration: cfg)
+        let model = try MLModel(contentsOf: compiledURL, configuration: cfg)
+        let elapsedMs = Date().timeIntervalSince(t0) * 1000.0
+        onBucketCompiled?(name, elapsedMs)
+        return model
     }
 
     /// Return a compiled `.mlmodelc` URL, reusing a cached copy if its mtime
