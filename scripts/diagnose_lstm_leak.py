@@ -27,7 +27,7 @@ from torch_kitten import (TextStage, KittenTTS, WeightBag)  # noqa: E402
 
 import coremltools as ct  # noqa: E402
 
-SAFE = "Sources/KittenTTS/Resources/nano/kitten_tts_nano_v0_8.safetensors"
+SAFE = "Sources/KittenApp/Resources/nano/kitten_tts_nano_v0_8.safetensors"
 VOICES = "scripts/models/voices.npz"
 
 

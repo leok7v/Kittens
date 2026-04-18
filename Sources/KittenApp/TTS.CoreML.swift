@@ -310,9 +310,22 @@ public final class KittenTTSCoreML: @unchecked Sendable {
     private func compileAndLoad(name: String) async throws -> MLModel {
         let cfg = MLModelConfiguration()
         cfg.computeUnits = .all
-        let packageURL = try Self.packageURL(name: "\(name).mlpackage")
+        guard let found = Self.resourceURL(name: name) else {
+            throw NSError(domain: "KittenTTSCoreML", code: 5,
+                          userInfo: [NSLocalizedDescriptionKey:
+                                     "bundle has no \(name).mlmodelc or \(name).mlpackage"])
+        }
+        // Precompiled .mlmodelc in the app bundle → skip the compile step entirely.
+        if found.isCompiled {
+            let t0 = Date()
+            let model = try MLModel(contentsOf: found.url, configuration: cfg)
+            let elapsedMs = Date().timeIntervalSince(t0) * 1000.0
+            onBucketCompiled?("\(name) (precompiled)", elapsedMs)
+            return model
+        }
+        // Fallback: compile .mlpackage on first use, cache compiled bundle.
         let t0 = Date()
-        let compiledURL = try await Self.compiledModelURL(packageURL: packageURL, name: name)
+        let compiledURL = try await Self.compiledModelURL(packageURL: found.url, name: name)
         let model = try MLModel(contentsOf: compiledURL, configuration: cfg)
         let elapsedMs = Date().timeIntervalSince(t0) * 1000.0
         onBucketCompiled?(name, elapsedMs)
@@ -348,15 +361,25 @@ public final class KittenTTSCoreML: @unchecked Sendable {
         return compiledURL
     }
 
-    private static func packageURL(name: String) throws -> URL {
-        #if SWIFT_PACKAGE
-        if let base = Bundle.module.resourceURL {
-            let u = base.appendingPathComponent("coreml").appendingPathComponent(name)
-            if FileManager.default.fileExists(atPath: u.path) { return u }
+    /// Locate a CoreML resource (precompiled .mlmodelc preferred, .mlpackage
+    /// fallback). Checks folder-reference paths (`coreml/<name>.<ext>`) and
+    /// flat layouts. Returns whichever exists.
+    private static func resourceURL(name: String) -> (url: URL, isCompiled: Bool)? {
+        for ext in ["mlmodelc", "mlpackage"] {
+            if let u = Bundle.main.url(forResource: name, withExtension: ext) {
+                return (u, ext == "mlmodelc")
+            }
         }
-        #endif
-        throw NSError(domain: "KittenTTSCoreML", code: 5,
-                      userInfo: [NSLocalizedDescriptionKey: "resource coreml/\(name) not found"])
+        // Xcode may preserve our "coreml/" subfolder as a folder reference.
+        if let base = Bundle.main.resourceURL {
+            for ext in ["mlmodelc", "mlpackage"] {
+                let u = base.appendingPathComponent("coreml/\(name).\(ext)")
+                if FileManager.default.fileExists(atPath: u.path) {
+                    return (u, ext == "mlmodelc")
+                }
+            }
+        }
+        return nil
     }
 
     private func loadVoices() throws {

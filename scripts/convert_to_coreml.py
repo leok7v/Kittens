@@ -62,7 +62,7 @@ def _sample_style() -> torch.Tensor:
 
 def convert_text_stage(L: int, save: bool = True, out_dir: Path = OUT_DIR) -> None:
     print(f"=== TextStage L={L} ===")
-    w = WeightBag.load("Sources/KittenTTS/Resources/nano/kitten_tts_nano_v0_8.safetensors")
+    w = WeightBag.load("Sources/KittenApp/Resources/nano/kitten_tts_nano_v0_8.safetensors")
     stage = TextStage(w).eval()
 
     input_ids = torch.randint(1, 170, (1, L), dtype=torch.long)
@@ -105,7 +105,7 @@ def convert_text_stage(L: int, save: bool = True, out_dir: Path = OUT_DIR) -> No
 def convert_generator_stage(n_frames: int, save: bool = True,
                             out_dir: Path = OUT_DIR) -> None:
     print(f"=== GeneratorStage N={n_frames} ===")
-    w = WeightBag.load("Sources/KittenTTS/Resources/nano/kitten_tts_nano_v0_8.safetensors")
+    w = WeightBag.load("Sources/KittenApp/Resources/nano/kitten_tts_nano_v0_8.safetensors")
     stage = GeneratorStage(w).eval()
 
     prosody_lr = torch.randn(1, 256, n_frames)

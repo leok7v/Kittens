@@ -1,7 +1,7 @@
 import Foundation
 import MLX
 import MLXNN
-import CEPhonemizer
+// CEPhonemizer's C API is exposed via KittenApp-Bridging-Header.h — no import needed.
 
 // MARK: - KittenTTS Implementation
 
@@ -54,18 +54,18 @@ public final class KittenTTS: @unchecked Sendable {
 
     /// Copy bundled mlx.metallib next to the running binary so MLX's
     /// colocated-search finds it without any env vars or path hacks.
+    /// Used when running a CLI binary from SwiftPM; the Xcode app flow
+    /// relies on mlx-swift's own bundling and this becomes a no-op.
     private static var metalLibInstalled = false
     private static func installMetalLib() {
         guard !metalLibInstalled else { return }
         metalLibInstalled = true
-        #if SWIFT_PACKAGE
-        guard let src = Bundle.module.url(forResource: "mlx", withExtension: "metallib") else { return }
+        guard let src = Bundle.main.url(forResource: "mlx", withExtension: "metallib") else { return }
         let binDir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
         let dst = binDir.appendingPathComponent("mlx.metallib")
         if !FileManager.default.fileExists(atPath: dst.path) {
             try? FileManager.default.copyItem(at: src, to: dst)
         }
-        #endif
     }
 
     /// Pre-load model weights so the first `speak` call starts instantly.
@@ -401,15 +401,22 @@ struct TextChunker {
 // MARK: - Model Loader
 
 struct ModelLoader {
+    /// Locate the bundled model directory (holds voices.safetensors, weights,
+    /// en_list, en_rules). Xcode's filesystem-synchronized groups can surface
+    /// the folder either as a blue folder reference (preserves "nano/" path)
+    /// or flatten individual files into the bundle root — try both.
     static func bundledModelDir() -> URL? {
-        #if SWIFT_PACKAGE
-        guard let base = Bundle.module.resourceURL else { return nil }
-        let subdir = base.appendingPathComponent("nano", isDirectory: true)
-        if FileManager.default.fileExists(atPath: subdir.path) { return subdir }
+        if let base = Bundle.main.resourceURL {
+            let nano = base.appendingPathComponent("nano", isDirectory: true)
+            if FileManager.default.fileExists(atPath: nano.appendingPathComponent("voices.safetensors").path) {
+                return nano
+            }
+            // Flat layout: files landed at bundle root.
+            if FileManager.default.fileExists(atPath: base.appendingPathComponent("voices.safetensors").path) {
+                return base
+            }
+        }
         return nil
-        #else
-        return nil
-        #endif
     }
 
     public static func bundledVoiceIDs() -> [String] {

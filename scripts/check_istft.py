@@ -59,7 +59,7 @@ def main():
     rpt("Mul (exp*cos(sin(phase)))", mul, real)
     rpt("Mul_1 (exp*sin(sin(phase)))", mul1, imag)
 
-    w = WeightBag.load("Sources/KittenTTS/Resources/nano/kitten_tts_nano_v0_8.safetensors")
+    w = WeightBag.load("Sources/KittenApp/Resources/nano/kitten_tts_nano_v0_8.safetensors")
     wReal = w.f32("kmodel.decoder.generator.stft.weight_backward_real")
     wImag = w.f32("kmodel.decoder.generator.stft.weight_backward_imag")
     ar = F.conv_transpose1d(real, wReal, stride=5, padding=0)

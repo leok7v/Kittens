@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from torch_kitten import KittenTTS, TextStage, WeightBag  # noqa: E402
 import coremltools as ct  # noqa: E402
 
-SAFE = "Sources/KittenTTS/Resources/nano/kitten_tts_nano_v0_8.safetensors"
+SAFE = "Sources/KittenApp/Resources/nano/kitten_tts_nano_v0_8.safetensors"
 ONNX = "scripts/models/kitten_tts_nano_v0_8.onnx"
 
 

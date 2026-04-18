@@ -65,8 +65,8 @@
 			);
 			name = KittenApp;
 			packageProductDependencies = (
-				B3F355B02F905000001258AE /* KittenTTS */,
 				B3F355B12F905000001258AE /* MLX */,
+				B3F355B22F905000001258AE /* MLXNN */,
 			);
 			productName = KittenTTSApp;
 			productReference = B3F355972F904FAC001258AE /* KittenApp.app */;
@@ -97,7 +97,7 @@
 			mainGroup = B3F3558E2F904FAC001258AE;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				B3F355AF2F905000001258AE /* XCLocalSwiftPackageReference "." */,
+				B3F355AF2F905000001258AE /* XCLocalSwiftPackageReference "Vendor/mlx-swift" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = B3F355982F904FAC001258AE /* Products */;
@@ -268,6 +268,12 @@
 				ENABLE_RESOURCE_ACCESS_PRINTING = NO;
 				ENABLE_RESOURCE_ACCESS_USB = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++17";
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Sources/KittenApp/CEPhonemizer",
+					"$(SRCROOT)/Sources/KittenApp/CEPhonemizer/include",
+				);
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Sources/KittenApp/KittenApp-Bridging-Header.h";
 				GENERATE_INFOPLIST_FILE = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -322,6 +328,12 @@
 				ENABLE_RESOURCE_ACCESS_PRINTING = NO;
 				ENABLE_RESOURCE_ACCESS_USB = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++17";
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Sources/KittenApp/CEPhonemizer",
+					"$(SRCROOT)/Sources/KittenApp/CEPhonemizer/include",
+				);
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Sources/KittenApp/KittenApp-Bridging-Header.h";
 				GENERATE_INFOPLIST_FILE = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -378,21 +390,22 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		B3F355AF2F905000001258AE /* XCLocalSwiftPackageReference "." */ = {
+		B3F355AF2F905000001258AE /* XCLocalSwiftPackageReference "Vendor/mlx-swift" */ = {
 			isa = XCLocalSwiftPackageReference;
-			relativePath = .;
+			relativePath = "Vendor/mlx-swift";
 		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		B3F355B02F905000001258AE /* KittenTTS */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = KittenTTS;
-		};
 		B3F355B12F905000001258AE /* MLX */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = B3F355AF2F905000001258AE /* XCLocalSwiftPackageReference "." */;
+			package = B3F355AF2F905000001258AE /* XCLocalSwiftPackageReference "Vendor/mlx-swift" */;
 			productName = MLX;
+		};
+		B3F355B22F905000001258AE /* MLXNN */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B3F355AF2F905000001258AE /* XCLocalSwiftPackageReference "Vendor/mlx-swift" */;
+			productName = MLXNN;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

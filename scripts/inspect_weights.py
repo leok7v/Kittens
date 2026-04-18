@@ -30,7 +30,7 @@ def dump_safetensors(path: Path, grep: str | None) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--safetensors", default="Sources/KittenTTS/Resources/nano/kitten_tts_nano_v0_8.safetensors")
+    ap.add_argument("--safetensors", default="Sources/KittenApp/Resources/nano/kitten_tts_nano_v0_8.safetensors")
     ap.add_argument("--voices", default="scripts/models/voices.npz")
     ap.add_argument("--grep", default=None, help="substring filter")
     args = ap.parse_args()

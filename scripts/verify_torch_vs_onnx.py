@@ -119,7 +119,7 @@ def main():
     ap.add_argument("--onnx", type=Path,
                     default=Path("scripts/models/kitten_tts_nano_v0_8.onnx"))
     ap.add_argument("--safetensors", type=Path,
-                    default=Path("Sources/KittenTTS/Resources/nano/kitten_tts_nano_v0_8.safetensors"))
+                    default=Path("Sources/KittenApp/Resources/nano/kitten_tts_nano_v0_8.safetensors"))
     ap.add_argument("--voices", type=Path,
                     default=Path("scripts/models/voices.npz"))
     ap.add_argument("--voice", default="expr-voice-5-m")

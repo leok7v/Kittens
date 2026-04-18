@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PyTorch port of Sources/KittenTTS/TTS.swift's kittenForward.
+"""PyTorch port of Sources/KittenApp/TTS.swift's kittenForward.
 
 Serves two purposes:
   1. coremltools.convert needs a torch.nn.Module; this file provides

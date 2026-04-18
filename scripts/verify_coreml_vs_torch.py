@@ -65,7 +65,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-L", type=int, default=128)
     ap.add_argument("--voice", default="expr-voice-5-m")
-    ap.add_argument("--safetensors", default="Sources/KittenTTS/Resources/nano/kitten_tts_nano_v0_8.safetensors")
+    ap.add_argument("--safetensors", default="Sources/KittenApp/Resources/nano/kitten_tts_nano_v0_8.safetensors")
     ap.add_argument("--voices", default="scripts/models/voices.npz")
     args = ap.parse_args()
 

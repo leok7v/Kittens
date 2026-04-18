@@ -46,7 +46,7 @@ def compare(label: str, a: np.ndarray, b: np.ndarray) -> None:
 
 def main():
     onnx_path = Path("scripts/models/kitten_exposed.onnx")
-    safe = Path("Sources/KittenTTS/Resources/nano/kitten_tts_nano_v0_8.safetensors")
+    safe = Path("Sources/KittenApp/Resources/nano/kitten_tts_nano_v0_8.safetensors")
     voices = np.load("scripts/models/voices.npz")
 
     rng = np.random.default_rng(0)

@@ -1,6 +1,5 @@
 import SwiftUI
 import Combine
-import KittenTTS
 import MLX
 import AVFoundation
 
