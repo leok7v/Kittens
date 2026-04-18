@@ -1,5 +1,6 @@
 import Foundation
-import CoreML
+@preconcurrency import CoreML
+import os
 import MLX  // used only for loading voices.safetensors; forward pass is all CoreML
 
 /// CoreML-backed alternative to `KittenTTS`. Keeps the same public API so
@@ -10,9 +11,9 @@ import MLX  // used only for loading voices.safetensors; forward pass is all Cor
 /// GeneratorStage packages) and pick the smallest bucket that fits each
 /// chunk. Buckets are compiled on first use (≈5s cold cost per bucket)
 /// and cached on disk in Caches/KittenTTS/.
-public final class KittenTTSCoreML: @unchecked Sendable {
+public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
 
-    public struct Config {
+    public nonisolated struct Config: Sendable {
         public var speed: Float
         public var voiceID: String
         public init(speed: Float = 1.0, voiceID: String = "Leo") {
@@ -48,7 +49,10 @@ public final class KittenTTSCoreML: @unchecked Sendable {
     private var textModels: [Int: MLModel] = [:]
     private var generatorModels: [Int: MLModel] = [:]
     private var voiceEmbeds: [String: [Float]] = [:]   // flattened 400*256
-    private let loadLock = NSLock()
+    // OSAllocatedUnfairLock.withLock is safe to call from async contexts (as
+    // long as the closure body is synchronous, which ours is). NSLock would
+    // warn in Swift 6 mode.
+    private let loadLock = OSAllocatedUnfairLock()
 
     public static var voiceAliases: [String: String] { KittenTTS.voiceAliases }
     public static var voiceDisplayOrder: [String] { KittenTTS.voiceDisplayOrder }
@@ -76,10 +80,10 @@ public final class KittenTTSCoreML: @unchecked Sendable {
     /// Release all loaded MLModel buckets (voice table stays — it's 400 KB).
     /// Call this when switching to another backend to free RAM.
     public func unload() {
-        loadLock.lock()
-        textModels.removeAll()
-        generatorModels.removeAll()
-        loadLock.unlock()
+        loadLock.withLock {
+            textModels.removeAll()
+            generatorModels.removeAll()
+        }
     }
 
     public func speak(
@@ -313,16 +317,16 @@ public final class KittenTTSCoreML: @unchecked Sendable {
     // MARK: - Lazy bucket loaders
 
     private func textBucket(_ L: Int) async throws -> MLModel {
-        if let cached = textModels[L] { return cached }
+        if let cached = loadLock.withLock({ textModels[L] }) { return cached }
         let m = try await compileAndLoad(name: "kitten_text_L\(L)")
-        loadLock.lock(); textModels[L] = m; loadLock.unlock()
+        loadLock.withLock { textModels[L] = m }
         return m
     }
 
     private func generatorBucket(_ N: Int) async throws -> MLModel {
-        if let cached = generatorModels[N] { return cached }
+        if let cached = loadLock.withLock({ generatorModels[N] }) { return cached }
         let m = try await compileAndLoad(name: "kitten_generator_N\(N)")
-        loadLock.lock(); generatorModels[N] = m; loadLock.unlock()
+        loadLock.withLock { generatorModels[N] = m }
         return m
     }
 

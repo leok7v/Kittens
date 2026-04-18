@@ -96,8 +96,10 @@ struct KittenTTSView: View {
     @State private var isGenerating: Bool = false
     @State private var status: String = "Loading model..."
     @State private var modelReady: Bool = false
-    @State private var voice: String = "Leo"
-    @State private var backend: Backend = .mlx
+    // Voice + backend persist across launches; speed is session-only.
+    @AppStorage("voice")   private var voice: String = "Kiki"
+    @AppStorage("backend") private var backend: Backend = .coreml
+    @State private var speed: Float = 1.0
     @StateObject private var log = MetricsLog()
 
     private let mlxTTS = KittenTTS()
@@ -136,6 +138,14 @@ struct KittenTTSView: View {
                         .pickerStyle(.segmented)
                         .frame(maxWidth: 200)
                         .disabled(isGenerating)
+                    }
+                    HStack {
+                        Text("Speed").font(.caption).foregroundColor(.secondary)
+                        Slider(value: $speed, in: 0.5...2.0, step: 0.05)
+                        Text(String(format: "%.2f×", speed))
+                            .font(.caption.monospaced())
+                            .frame(width: 52, alignment: .trailing)
+                            .foregroundColor(.secondary)
                     }
                 }
 
@@ -325,14 +335,15 @@ struct KittenTTSView: View {
                         self.status = "Streaming [\(tag)]..."
                     }
                 }
+                let capturedSpeed = speed
                 let totalSamples: Int
                 switch captured {
                 case .mlx:
-                    let cfg = KittenTTS.Config(speed: 1.0, voiceID: voice)
+                    let cfg = KittenTTS.Config(speed: capturedSpeed, voiceID: voice)
                     let s = try await mlxTTS.speak(text: text, config: cfg, callback: cb)
                     totalSamples = s.count
                 case .coreml:
-                    let cfg = KittenTTSCoreML.Config(speed: 1.0, voiceID: voice)
+                    let cfg = KittenTTSCoreML.Config(speed: capturedSpeed, voiceID: voice)
                     let s = try await coreMLTTS.speak(text: text, config: cfg, callback: cb)
                     totalSamples = s.count
                 }

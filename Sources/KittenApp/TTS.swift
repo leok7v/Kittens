@@ -5,10 +5,10 @@ import MLXNN
 
 // MARK: - KittenTTS Implementation
 
-public final class KittenTTS: @unchecked Sendable {
+public final nonisolated class KittenTTS: @unchecked Sendable {
     static let weightsFilename = "kitten_tts_nano_v0_8.safetensors"
 
-    public struct Config {
+    public nonisolated struct Config: Sendable {
         public var speed: Float
         public var voiceID: String
         public init(speed: Float = 1.0, voiceID: String = "Leo") {
@@ -56,7 +56,8 @@ public final class KittenTTS: @unchecked Sendable {
     /// colocated-search finds it without any env vars or path hacks.
     /// Used when running a CLI binary from SwiftPM; the Xcode app flow
     /// relies on mlx-swift's own bundling and this becomes a no-op.
-    private static var metalLibInstalled = false
+    // Called at-most-once from the single-threaded init() path; unsafe is fine.
+    private nonisolated(unsafe) static var metalLibInstalled = false
     private static func installMetalLib() {
         guard !metalLibInstalled else { return }
         metalLibInstalled = true
@@ -70,7 +71,7 @@ public final class KittenTTS: @unchecked Sendable {
 
     /// Pre-load model weights so the first `speak` call starts instantly.
     public func preload(modelPath: String? = nil) async throws {
-        try await Device.withDefaultDevice(.gpu) {
+        try Device.withDefaultDevice(.gpu) {
             _ = try loadWeightsIfNeeded(modelPath: modelPath)
         }
     }
@@ -110,7 +111,7 @@ public final class KittenTTS: @unchecked Sendable {
         config: Config = Config(),
         callback: SpeakCallback? = nil
     ) async throws -> [Float] {
-        return try await Device.withDefaultDevice(.gpu) {
+        return try Device.withDefaultDevice(.gpu) {
             let (weights, voices) = try loadWeightsIfNeeded(modelPath: modelPath)
 
             let voiceID = KittenTTS.voiceAliases[config.voiceID] ?? config.voiceID
@@ -451,7 +452,9 @@ struct Phonemizer {
         uniquingKeysWith: { _, new in new })
 
     /// Lazily-created C++ phonemizer handle backed by bundled en_rules / en_list.
-    private static let handle: PhonemizerHandle? = {
+    /// The C engine is thread-safe for reads after construction; Swift just
+    /// can't prove it because UnsafeMutableRawPointer is non-Sendable.
+    private nonisolated(unsafe) static let handle: PhonemizerHandle? = {
         guard let modelDir = ModelLoader.bundledModelDir() else { return nil }
         let rulesPath = modelDir.appendingPathComponent("en_rules").path
         let listPath  = modelDir.appendingPathComponent("en_list").path

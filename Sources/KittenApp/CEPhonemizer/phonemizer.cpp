@@ -12,6 +12,15 @@
 #include <iostream>
 #include <unordered_set>
 
+// This file is a ~7k-line IPA phonemizer ported from external C++ source.
+// A handful of compile-time placeholder variables and an intentionally-
+// disabled rule block (`if (is_en_us && false)` guarded with a comment
+// explaining the regression it caused) trigger warnings. Suppress them
+// at file scope rather than scattering pragmas or deleting deliberate
+// dead code.
+#pragma clang diagnostic ignored "-Wunused-variable"
+#pragma clang diagnostic ignored "-Wunreachable-code"
+
 // ============================================================
 // UTF-8 / String helpers
 // ============================================================
@@ -7009,21 +7018,18 @@ std::string IPAPhonemizer::phonemizeText(const std::string& text) const {
                         standalone = false;
                 }
                 if (standalone) {
-                    // Find next word token and check if it starts with rhotic phoneme 'r'
-                    for (size_t tj = ti + 1; tj < tokens.size(); tj++) {
-                        if (!tokens[tj].is_word) break; // punctuation stops rule
-                        if (tokens[tj].text.empty()) break;
+                    // Peek the next word token (stop at punctuation) and, if it
+                    // starts with rhotic 'r', promote trailing '@' to '3' (ɚ).
+                    const size_t tj = ti + 1;
+                    if (tj < tokens.size() && tokens[tj].is_word && !tokens[tj].text.empty()) {
                         std::string nph = wordToPhonemes(tokens[tj].text);
-                        // Skip stress/modifier markers to find first real phoneme
                         size_t pi = 0;
                         while (pi < nph.size() &&
                                (nph[pi]=='\''||nph[pi]==','||nph[pi]=='%'||nph[pi]=='='))
                             pi++;
                         if (pi < nph.size() && nph[pi] == 'r') {
-                            // Change trailing '@' to '3' (rhotic schwa ɚ)
                             ph_codes.back() = '3';
                         }
-                        break;
                     }
                 }
             }
