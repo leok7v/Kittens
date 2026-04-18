@@ -5,23 +5,36 @@ import KittenTTS
 struct KittenCLI {
     static func main() async throws {
         setbuf(stdout, nil)
-        let text = CommandLine.arguments.count > 1
-            ? CommandLine.arguments[1]
+        var args = Array(CommandLine.arguments.dropFirst())
+        var backend = "mlx"
+        if let i = args.firstIndex(where: { $0 == "--backend" }), i + 1 < args.count {
+            backend = args[i + 1]
+            args.removeSubrange(i...(i + 1))
+        }
+        let text = args.count > 0
+            ? args[0]
             : "Hello from Kittens. This is a self contained text to speech system."
-        let voice = CommandLine.arguments.count > 2
-            ? CommandLine.arguments[2]
-            : "Leo"
-
-        let tts = KittenTTS()
-        let config = KittenTTS.Config(speed: 1.0, voiceID: voice)
+        let voice = args.count > 1 ? args[1] : "Leo"
 
         print("Synthesizing: \"\(text)\"")
-        print("Voice: \(voice)")
+        print("Voice: \(voice)   Backend: \(backend)")
 
         let start = Date()
         var firstByteDate: Date?
-        let samples = try await tts.speak(text: text, config: config) { _, _ in
-            if firstByteDate == nil { firstByteDate = Date() }
+        let samples: [Float]
+        switch backend {
+        case "coreml":
+            let tts = KittenTTSCoreML()
+            let config = KittenTTSCoreML.Config(speed: 1.0, voiceID: voice)
+            samples = try await tts.speak(text: text, config: config) { _, _ in
+                if firstByteDate == nil { firstByteDate = Date() }
+            }
+        default:
+            let tts = KittenTTS()
+            let config = KittenTTS.Config(speed: 1.0, voiceID: voice)
+            samples = try await tts.speak(text: text, config: config) { _, _ in
+                if firstByteDate == nil { firstByteDate = Date() }
+            }
         }
         let end = Date()
         let total = end.timeIntervalSince(start)
@@ -35,8 +48,7 @@ struct KittenCLI {
         print("  Real-time factor:   \(String(format: "%.1f", duration / total))x")
         print("  Samples:            \(samples.count)")
 
-        // Write WAV
-        let output = "output.wav"
+        let output = "output_\(backend).wav"
         try saveWav(samples: samples, path: output)
         print("  Saved to:           \(output)")
     }

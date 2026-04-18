@@ -35,6 +35,7 @@ let package = Package(
             resources: [
                 .copy("Resources/nano"),
                 .copy("Resources/mlx.metallib"),
+                .copy("Resources/coreml"),
             ]
         ),
         // CLI test harness

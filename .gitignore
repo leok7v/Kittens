@@ -10,3 +10,17 @@ DerivedData/
 *.o
 *.d
 .DS_Store
+
+# Python (scripts/)
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Regenerable model artifacts for Python tooling:
+#   - ONNX + voices.npz downloaded from HuggingFace by the scripts
+#   - intermediate .mlpackage buckets emitted by convert_to_coreml.py
+#   - graph-surgery copies emitted by onnx_expose.py
+# The canonical .mlpackages the Swift app loads live in
+# Sources/KittenTTS/Resources/coreml/ and ARE tracked.
+scripts/models/

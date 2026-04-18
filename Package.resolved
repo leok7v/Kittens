@@ -1,0 +1,15 @@
+{
+  "originHash" : "da8f419048ed5afd4588ce8310711337ad17e0f86ae0d3604c62af444c997f48",
+  "pins" : [
+    {
+      "identity" : "swift-numerics",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-numerics",
+      "state" : {
+        "revision" : "0c0290ff6b24942dadb83a929ffaaa1481df04a2",
+        "version" : "1.1.1"
+      }
+    }
+  ],
+  "version" : 3
+}
