@@ -59,10 +59,18 @@ public final class KittenTTSCoreML: @unchecked Sendable {
         _ = KittenTTS()
     }
 
-    /// Pre-warm voice table. Models compile lazily on first `speak()` call.
+    /// Load voice table, all bucket models, and run a dummy inference through
+    /// each model so ANE's first-use JIT compile happens now (while the UI is
+    /// still showing "Loading…") instead of on the user's first speak.
+    /// Takes a few seconds per backend switch but makes every speak fast.
     public func preload() async throws {
-        if !voiceEmbeds.isEmpty { return }
-        try loadVoices()
+        if voiceEmbeds.isEmpty { try loadVoices() }
+        for L in Self.textBuckets {
+            _ = try await textBucket(L)
+        }
+        for N in Self.generatorBuckets {
+            _ = try await generatorBucket(N)
+        }
     }
 
     /// Release all loaded MLModel buckets (voice table stays — it's 400 KB).
@@ -326,21 +334,74 @@ public final class KittenTTSCoreML: @unchecked Sendable {
                           userInfo: [NSLocalizedDescriptionKey:
                                      "bundle has no \(name).mlmodelc or \(name).mlpackage"])
         }
-        // Precompiled .mlmodelc in the app bundle → skip the compile step entirely.
+        let loadStart = Date()
+        let model: MLModel
+        var displayName = name
         if found.isCompiled {
-            let t0 = Date()
-            let model = try MLModel(contentsOf: found.url, configuration: cfg)
-            let elapsedMs = Date().timeIntervalSince(t0) * 1000.0
-            onBucketLoaded?("\(name) (precompiled)", elapsedMs)
-            return model
+            model = try MLModel(contentsOf: found.url, configuration: cfg)
+            displayName += " (precompiled)"
+        } else {
+            // Fallback: compile .mlpackage on first use, cache compiled bundle.
+            let compiledURL = try await Self.compiledModelURL(packageURL: found.url, name: name)
+            model = try MLModel(contentsOf: compiledURL, configuration: cfg)
         }
-        // Fallback: compile .mlpackage on first use, cache compiled bundle.
-        let t0 = Date()
-        let compiledURL = try await Self.compiledModelURL(packageURL: found.url, name: name)
-        let model = try MLModel(contentsOf: compiledURL, configuration: cfg)
-        let elapsedMs = Date().timeIntervalSince(t0) * 1000.0
-        onBucketLoaded?(name, elapsedMs)
+        let loadMs = Date().timeIntervalSince(loadStart) * 1000.0
+
+        // Run one dummy inference to trigger ANE's on-first-use JIT compile
+        // now, rather than on the user's first speak. Adds ~0.5–2s per bucket
+        // to preload but moves the cost off the user's critical path.
+        let warmStart = Date()
+        try await warmup(model: model, name: name)
+        let warmMs = Date().timeIntervalSince(warmStart) * 1000.0
+
+        onBucketLoaded?("\(displayName) load \(Int(loadMs))ms + warmup",
+                         warmMs)
         return model
+    }
+
+    /// Feed a zero-filled input through the model once, forcing ANE to do
+    /// its JIT compile while we're still in "loading" UX. We discard the
+    /// output.
+    private func warmup(model: MLModel, name: String) async throws {
+        let input: MLDictionaryFeatureProvider
+        if let L = Self.bucketSize(name: name, prefix: "kitten_text_L") {
+            let ids = try MLMultiArray(shape: [1, NSNumber(value: L)], dataType: .int32)
+            let style = try MLMultiArray(shape: [1, 256], dataType: .float32)
+            let mask = try MLMultiArray(shape: [1, NSNumber(value: L)], dataType: .float32)
+            // MLMultiArray buffers aren't necessarily zero-initialised — memset.
+            Self.zeroFill(ids, count: L, stride: MemoryLayout<Int32>.size)
+            Self.zeroFill(style, count: 256, stride: MemoryLayout<Float>.size)
+            Self.zeroFill(mask, count: L, stride: MemoryLayout<Float>.size)
+            input = try MLDictionaryFeatureProvider(dictionary: [
+                "input_ids":       MLFeatureValue(multiArray: ids),
+                "style":           MLFeatureValue(multiArray: style),
+                "attention_mask":  MLFeatureValue(multiArray: mask),
+            ])
+        } else if let N = Self.bucketSize(name: name, prefix: "kitten_generator_N") {
+            let prosody = try MLMultiArray(shape: [1, 256, NSNumber(value: N)], dataType: .float32)
+            let text = try MLMultiArray(shape: [1, 128, NSNumber(value: N)], dataType: .float32)
+            let style = try MLMultiArray(shape: [1, 256], dataType: .float32)
+            Self.zeroFill(prosody, count: 256 * N, stride: MemoryLayout<Float>.size)
+            Self.zeroFill(text, count: 128 * N, stride: MemoryLayout<Float>.size)
+            Self.zeroFill(style, count: 256, stride: MemoryLayout<Float>.size)
+            input = try MLDictionaryFeatureProvider(dictionary: [
+                "prosody_lr": MLFeatureValue(multiArray: prosody),
+                "text_lr":    MLFeatureValue(multiArray: text),
+                "style":      MLFeatureValue(multiArray: style),
+            ])
+        } else {
+            return  // unknown model name, skip warmup
+        }
+        _ = try await model.prediction(from: input)
+    }
+
+    private static func bucketSize(name: String, prefix: String) -> Int? {
+        guard name.hasPrefix(prefix) else { return nil }
+        return Int(name.dropFirst(prefix.count))
+    }
+
+    private static func zeroFill(_ a: MLMultiArray, count: Int, stride: Int) {
+        memset(a.dataPointer, 0, count * stride)
     }
 
     /// Return a compiled `.mlmodelc` URL, reusing a cached copy if its mtime
