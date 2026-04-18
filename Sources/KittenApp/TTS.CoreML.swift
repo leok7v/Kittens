@@ -6,11 +6,16 @@ import MLX  // used only for loading voices.safetensors; forward pass is all Cor
 /// CoreML-backed alternative to `KittenTTS`. Keeps the same public API so
 /// `KittenApp` can A/B the two backends against each other.
 ///
-/// coremltools 9 flex shapes convert but fail at runtime, so we ship a
-/// bucket set (several fixed-L TextStage packages, several fixed-N
-/// GeneratorStage packages) and pick the smallest bucket that fits each
-/// chunk. Buckets are compiled on first use (≈5s cold cost per bucket)
-/// and cached on disk in Caches/KittenTTS/.
+/// **Multifunction** `.mlpackage` layout (as of Plan B in INVESTIGATE.md):
+/// one file per (stage × variant); each file contains a set of pre-compiled
+/// functions (`L_16`, `L_32`, …, `N_1024`) that share weights on disk and
+/// in memory. Swift picks the right function via
+/// `MLModelConfiguration.functionName`.
+///
+/// Dimensions the backend exposes for A/B:
+/// - `Variant`: precision. `fp32` / `fp16` / `int8w`. (`int8wa` blocked by
+///   a coremltools bug on int32 inputs — see INVESTIGATE.md.)
+/// - `Compute`: `.all` (let CoreML pick ANE/GPU/CPU) or `.cpuOnly`.
 public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
 
     public nonisolated struct Config: Sendable {
@@ -22,6 +27,17 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
         }
     }
 
+    public enum Variant: String, Sendable, CaseIterable {
+        case fp32
+        case fp16
+        case int8w
+    }
+
+    public enum Compute: String, Sendable, CaseIterable {
+        case all     = "All"
+        case cpuOnly = "CPU"
+    }
+
     public typealias SpeakCallback = (UnsafePointer<Int16>, Int) -> Void
 
     /// Metrics emitted by the backend for UI / CLI display.
@@ -29,66 +45,56 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
         public let phonemes: Int
         public let bucketL: Int
         public let bucketN: Int
+        public let variant: Variant
+        public let compute: Compute
         public let textStageMs: Double
         public let generatorStageMs: Double
         public let samples: Int
     }
 
-    /// Called after a bucket is ready to use — for bundle-precompiled
-    /// `.mlmodelc`s this is just the MLModel load time; for `.mlpackage`s
-    /// it includes Apple's on-device compile cost.
     public var onBucketLoaded: ((_ name: String, _ elapsedMs: Double) -> Void)?
-    /// Called once per speak() chunk, after audio is produced.
     public var onChunkMetrics: ((ChunkMetrics) -> Void)?
 
-    // Shipped bucket sizes. Keep sorted ascending.
-    static let textBuckets: [Int] = [16, 32, 64, 128]
-    static let generatorBuckets: [Int] = [128, 256, 512]
+    // Shipped bucket (function) sizes. Must match the function names inside
+    // the multifunction .mlpackages. Keep sorted ascending.
+    static let textBuckets: [Int] = [16, 32, 64, 128, 400]
+    static let generatorBuckets: [Int] = [128, 256, 512, 1024]
     static let audioPerFrame: Int = 300  // 24000 Hz / 80 Hz frame rate × 2 (F0 upsample)
 
-    private var textModels: [Int: MLModel] = [:]
-    private var generatorModels: [Int: MLModel] = [:]
+    /// Cache key: different variant / compute / bucket combos are distinct
+    /// MLModel instances because each binds its own MLModelConfiguration.
+    private struct Key: Hashable {
+        let stage: String        // "text" | "generator"
+        let variant: Variant
+        let compute: Compute
+        let bucket: Int
+    }
+
+    private var models: [Key: MLModel] = [:]
     private var voiceEmbeds: [String: [Float]] = [:]   // flattened 400*256
-    // OSAllocatedUnfairLock.withLock is safe to call from async contexts (as
-    // long as the closure body is synchronous, which ours is). NSLock would
-    // warn in Swift 6 mode.
     private let loadLock = OSAllocatedUnfairLock()
 
     public static var voiceAliases: [String: String] { KittenTTS.voiceAliases }
     public static var voiceDisplayOrder: [String] { KittenTTS.voiceDisplayOrder }
 
     public init() {
-        // Trigger KittenTTS's metallib install side effect so MLX can later
-        // read voices.safetensors without hitting "library not found".
-        _ = KittenTTS()
+        _ = KittenTTS()  // triggers metallib install for MLX-shared voices load
     }
 
-    /// Load voice table, all bucket models, and run a dummy inference through
-    /// each model so ANE's first-use JIT compile happens now (while the UI is
-    /// still showing "Loading…") instead of on the user's first speak.
-    /// Takes a few seconds per backend switch but makes every speak fast.
     public func preload() async throws {
         if voiceEmbeds.isEmpty { try loadVoices() }
-        for L in Self.textBuckets {
-            _ = try await textBucket(L)
-        }
-        for N in Self.generatorBuckets {
-            _ = try await generatorBucket(N)
-        }
     }
 
-    /// Release all loaded MLModel buckets (voice table stays — it's 400 KB).
-    /// Call this when switching to another backend to free RAM.
+    /// Drop all loaded MLModel instances and anything they compiled.
     public func unload() {
-        loadLock.withLock {
-            textModels.removeAll()
-            generatorModels.removeAll()
-        }
+        loadLock.withLock { models.removeAll() }
     }
 
     public func speak(
         text: String,
         config: Config = Config(),
+        variant: Variant = .int8w,
+        compute: Compute = .all,
         callback: SpeakCallback? = nil
     ) async throws -> [Float] {
         try await preload()
@@ -110,8 +116,8 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
             let style = Array(voiceRows[(refId * 256)..<((refId + 1) * 256)])
 
             let audio = try await speakOneChunk(
-                phonemes: phonemes,
-                style: style, speed: effectiveSpeed)
+                phonemes: phonemes, style: style, speed: effectiveSpeed,
+                variant: variant, compute: compute)
             if let cb = callback {
                 let int16 = audio.map { Int16(clamping: Int(($0 * 32767.0).rounded())) }
                 int16.withUnsafeBufferPointer { buf in
@@ -125,15 +131,17 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
 
     // MARK: - Pipeline for a single chunk
 
-    private func speakOneChunk(phonemes: [Int], style: [Float], speed: Float) async throws -> [Float] {
-        // Pick the smallest text bucket that fits, clipping to max if longer.
+    private func speakOneChunk(
+        phonemes: [Int], style: [Float], speed: Float,
+        variant: Variant, compute: Compute
+    ) async throws -> [Float] {
         let realL = phonemes.count
         let L = Self.textBuckets.first(where: { $0 >= realL }) ?? Self.textBuckets.last!
         let clippedL = min(realL, L)
-        let textModel = try await textBucket(L)
+        let textModel = try await model(stage: "text", variant: variant,
+                                        compute: compute, bucket: L)
         let tTextStart = Date()
 
-        // 1. Build padded input_ids [1, L] int32 + attention_mask [1, L] float32.
         let idsArr = try MLMultiArray(shape: [1, NSNumber(value: L)], dataType: .int32)
         let idsPtr = idsArr.dataPointer.bindMemory(to: Int32.self, capacity: L)
         let maskArr = try MLMultiArray(shape: [1, NSNumber(value: L)], dataType: .float32)
@@ -142,21 +150,20 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
             idsPtr[i] = i < clippedL ? Int32(phonemes[i]) : 0
             maskPtr[i] = i < clippedL ? 1.0 : 0.0
         }
-        // 2. Build style [1, 256] float32.
         let styleArr = try MLMultiArray(shape: [1, 256], dataType: .float32)
         let stylePtr = styleArr.dataPointer.bindMemory(to: Float.self, capacity: 256)
         for i in 0..<256 { stylePtr[i] = style[i] }
 
         let textIn = try MLDictionaryFeatureProvider(dictionary: [
-            "input_ids": MLFeatureValue(multiArray: idsArr),
-            "style": MLFeatureValue(multiArray: styleArr),
+            "input_ids":      MLFeatureValue(multiArray: idsArr),
+            "style":          MLFeatureValue(multiArray: styleArr),
             "attention_mask": MLFeatureValue(multiArray: maskArr),
         ])
         let textOut = try await textModel.prediction(from: textIn)
 
-        var prosodyNCL: MLMultiArray?   // [1, 256, L]
-        var textFeatures: MLMultiArray? // [1, 128, L]
-        var durSig: MLMultiArray?       // [1, L, 50]
+        var prosodyNCL: MLMultiArray?
+        var textFeatures: MLMultiArray?
+        var durSig: MLMultiArray?
         for name in textOut.featureNames {
             guard let val = textOut.featureValue(for: name)?.multiArrayValue else { continue }
             let shape = val.shape.map { $0.intValue }
@@ -172,16 +179,11 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
                           userInfo: [NSLocalizedDescriptionKey: "unexpected TextStage outputs"])
         }
 
-        // MLMultiArrays from a MIL program arrive as float16 with padded
-        // strides on Apple Silicon (e.g. (1,128,50) stored as (8192,64,1) —
-        // last dim padded to 64 for SIMD alignment). Reading the raw
-        // dataPointer as Float32 gives garbage. Copy into packed fp32 arrays.
         let durSigFlat = try Self.copyToFloat32(durSig)
         let prosodyFlat = try Self.copyToFloat32(prosodyNCL)
         let textFlat = try Self.copyToFloat32(textFeatures)
         let textStageMs = Date().timeIntervalSince(tTextStart) * 1000.0
 
-        // 3. Compute durations from dur_sig for the real phonemes only.
         var durations: [Int] = []
         durations.reserveCapacity(clippedL)
         var totalFrames = 0
@@ -195,7 +197,6 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
             totalFrames += d
         }
 
-        // 4. Pick smallest generator bucket that fits; clip durations if needed.
         let nBucket = Self.generatorBuckets.first(where: { $0 >= totalFrames })
             ?? Self.generatorBuckets.last!
         if totalFrames > nBucket {
@@ -208,15 +209,14 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
             }
             totalFrames = durations.reduce(0, +)
         }
-        let generatorModel = try await generatorBucket(nBucket)
+        let generatorModel = try await model(stage: "generator", variant: variant,
+                                             compute: compute, bucket: nBucket)
         let tGenStart = Date()
 
-        // 5. Length regulation into [1, C, N].
         let prosodyLR = try MLMultiArray(shape: [1, 256, NSNumber(value: nBucket)], dataType: .float32)
         let textLR = try MLMultiArray(shape: [1, 128, NSNumber(value: nBucket)], dataType: .float32)
         let prosodyLRPtr = prosodyLR.dataPointer.bindMemory(to: Float.self, capacity: 256 * nBucket)
         let textLRPtr = textLR.dataPointer.bindMemory(to: Float.self, capacity: 128 * nBucket)
-        // Zero pad first.
         for i in 0..<(256 * nBucket) { prosodyLRPtr[i] = 0 }
         for i in 0..<(128 * nBucket) { textLRPtr[i] = 0 }
 
@@ -236,11 +236,10 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
             if frame >= nBucket { break }
         }
 
-        // 6. Run generator.
         let genIn = try MLDictionaryFeatureProvider(dictionary: [
             "prosody_lr": MLFeatureValue(multiArray: prosodyLR),
-            "text_lr": MLFeatureValue(multiArray: textLR),
-            "style": MLFeatureValue(multiArray: styleArr),
+            "text_lr":    MLFeatureValue(multiArray: textLR),
+            "style":      MLFeatureValue(multiArray: styleArr),
         ])
         let genOut = try await generatorModel.prediction(from: genIn)
         guard let wav = genOut.featureNames.compactMap({ genOut.featureValue(for: $0)?.multiArrayValue }).first else {
@@ -248,32 +247,26 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
                           userInfo: [NSLocalizedDescriptionKey: "generator produced no output"])
         }
 
-        // Output length is 600 * nBucket samples; real audio is 600 * totalFrames.
         let wavFlat = try Self.copyToFloat32(wav)
         let realSamples = totalFrames * Self.audioPerFrame * 2
         let take = min(realSamples, wavFlat.count)
         var output = Array(wavFlat.prefix(take))
-        // The model's last audio sample is whatever the generator happens to
-        // emit — not zero. Cutting mid-signal produces an audible click at
-        // chunk boundaries. Apply a 10 ms cosine fade-out so the final sample
-        // lands at ≈ 0 without perceptible change to the speech content.
         Self.applyTailFade(&output, fadeSamples: 240)
         let generatorStageMs = Date().timeIntervalSince(tGenStart) * 1000.0
         onChunkMetrics?(ChunkMetrics(
             phonemes: realL, bucketL: L, bucketN: nBucket,
+            variant: variant, compute: compute,
             textStageMs: textStageMs, generatorStageMs: generatorStageMs,
             samples: output.count))
         return output
     }
 
     /// Cosine fade the last `fadeSamples` of `samples` from 1× down to 0.
-    /// Eliminates the click when the generator's tail sample is non-zero.
     private static func applyTailFade(_ samples: inout [Float], fadeSamples: Int) {
         let n = min(fadeSamples, samples.count)
         guard n > 0 else { return }
         let start = samples.count - n
         for i in 0..<n {
-            // Half-cosine: 1 at i=0, 0 at i=n-1.
             let t = Float(i) / Float(n - 1 > 0 ? n - 1 : 1)
             let gain = 0.5 + 0.5 * cos(.pi * t)
             samples[start + i] *= gain
@@ -287,20 +280,15 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
         let strides = a.strides.map { $0.intValue }
         let packed = shape.reduce(1, *)
         var out = [Float](repeating: 0, count: packed)
-
-        // Walk every packed index, translate to the (possibly padded) src offset.
         var indices = Array(repeating: 0, count: shape.count)
         let rank = shape.count
 
-        func copyFromFp16() {
+        func walkFp16() {
             let src = a.dataPointer.assumingMemoryBound(to: UInt16.self)
             for dst in 0..<packed {
                 var srcOff = 0
                 for k in 0..<rank { srcOff += indices[k] * strides[k] }
-                // Decode IEEE 754 half via Float16 bit pattern.
-                let bits = src[srcOff]
-                out[dst] = Float(Float16(bitPattern: bits))
-                // Advance the index vector (row-major).
+                out[dst] = Float(Float16(bitPattern: src[srcOff]))
                 for k in stride(from: rank - 1, through: 0, by: -1) {
                     indices[k] += 1
                     if indices[k] < shape[k] { break }
@@ -308,8 +296,7 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
                 }
             }
         }
-
-        func copyFromFp32() {
+        func walkFp32() {
             let src = a.dataPointer.assumingMemoryBound(to: Float.self)
             for dst in 0..<packed {
                 var srcOff = 0
@@ -322,10 +309,9 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
                 }
             }
         }
-
         switch a.dataType {
-        case .float16: copyFromFp16()
-        case .float32: copyFromFp32()
+        case .float16: walkFp16()
+        case .float32: walkFp32()
         default:
             throw NSError(domain: "KittenTTSCoreML", code: 7,
                           userInfo: [NSLocalizedDescriptionKey:
@@ -334,103 +320,102 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
         return out
     }
 
-    // MARK: - Lazy bucket loaders
+    // MARK: - Lazy model loading (one MLModel per variant × compute × bucket)
 
-    private func textBucket(_ L: Int) async throws -> MLModel {
-        if let cached = loadLock.withLock({ textModels[L] }) { return cached }
-        let m = try await compileAndLoad(name: "kitten_text_L\(L)")
-        loadLock.withLock { textModels[L] = m }
-        return m
-    }
+    private func model(stage: String, variant: Variant, compute: Compute,
+                       bucket: Int) async throws -> MLModel {
+        let key = Key(stage: stage, variant: variant, compute: compute, bucket: bucket)
+        if let cached = loadLock.withLock({ models[key] }) { return cached }
 
-    private func generatorBucket(_ N: Int) async throws -> MLModel {
-        if let cached = loadLock.withLock({ generatorModels[N] }) { return cached }
-        let m = try await compileAndLoad(name: "kitten_generator_N\(N)")
-        loadLock.withLock { generatorModels[N] = m }
-        return m
-    }
+        let packageName = "kitten_\(stage)_\(variant.rawValue)"   // e.g. kitten_text_fp16
+        let axis = stage == "text" ? "L" : "N"
+        let functionName = "\(axis)_\(bucket)"
 
-    private func compileAndLoad(name: String) async throws -> MLModel {
         let cfg = MLModelConfiguration()
-        cfg.computeUnits = .all
-        guard let found = Self.resourceURL(name: name) else {
+        cfg.computeUnits = {
+            switch compute {
+            case .all:     return .all
+            case .cpuOnly: return .cpuOnly
+            }
+        }()
+        cfg.functionName = functionName
+
+        guard let found = Self.resourceURL(name: packageName) else {
             throw NSError(domain: "KittenTTSCoreML", code: 5,
                           userInfo: [NSLocalizedDescriptionKey:
-                                     "bundle has no \(name).mlmodelc or \(name).mlpackage"])
+                                     "bundle has no \(packageName).mlmodelc or \(packageName).mlpackage"])
         }
-        let loadStart = Date()
-        let model: MLModel
-        var displayName = name
+        let tLoadStart = Date()
+        let loaded: MLModel
         if found.isCompiled {
-            model = try MLModel(contentsOf: found.url, configuration: cfg)
-            displayName += " (precompiled)"
+            loaded = try MLModel(contentsOf: found.url, configuration: cfg)
         } else {
-            // Fallback: compile .mlpackage on first use, cache compiled bundle.
-            let compiledURL = try await Self.compiledModelURL(packageURL: found.url, name: name)
-            model = try MLModel(contentsOf: compiledURL, configuration: cfg)
+            let compiled = try await Self.compiledModelURL(packageURL: found.url, name: packageName)
+            loaded = try MLModel(contentsOf: compiled, configuration: cfg)
         }
-        let loadMs = Date().timeIntervalSince(loadStart) * 1000.0
+        let loadMs = Date().timeIntervalSince(tLoadStart) * 1000.0
 
-        // Run one dummy inference to trigger ANE's on-first-use JIT compile
-        // now, rather than on the user's first speak. Adds ~0.5–2s per bucket
-        // to preload but moves the cost off the user's critical path.
-        let warmStart = Date()
-        try await warmup(model: model, name: name)
-        let warmMs = Date().timeIntervalSince(warmStart) * 1000.0
+        let tWarmStart = Date()
+        try await warmup(model: loaded, stage: stage, bucket: bucket)
+        let warmMs = Date().timeIntervalSince(tWarmStart) * 1000.0
 
-        onBucketLoaded?("\(displayName) load \(Int(loadMs))ms + warmup",
-                         warmMs)
-        return model
+        let label = "\(packageName) [\(functionName)/\(compute.rawValue)]  load \(Int(loadMs))ms + warmup"
+        onBucketLoaded?(label, warmMs)
+
+        loadLock.withLock { models[key] = loaded }
+        return loaded
     }
 
-    /// Feed a zero-filled input through the model once, forcing ANE to do
-    /// its JIT compile while we're still in "loading" UX. We discard the
-    /// output.
-    private func warmup(model: MLModel, name: String) async throws {
+    private func warmup(model: MLModel, stage: String, bucket: Int) async throws {
         let input: MLDictionaryFeatureProvider
-        if let L = Self.bucketSize(name: name, prefix: "kitten_text_L") {
+        if stage == "text" {
+            let L = bucket
             let ids = try MLMultiArray(shape: [1, NSNumber(value: L)], dataType: .int32)
             let style = try MLMultiArray(shape: [1, 256], dataType: .float32)
             let mask = try MLMultiArray(shape: [1, NSNumber(value: L)], dataType: .float32)
-            // MLMultiArray buffers aren't necessarily zero-initialised — memset.
-            Self.zeroFill(ids, count: L, stride: MemoryLayout<Int32>.size)
-            Self.zeroFill(style, count: 256, stride: MemoryLayout<Float>.size)
-            Self.zeroFill(mask, count: L, stride: MemoryLayout<Float>.size)
+            memset(ids.dataPointer,   0, L * MemoryLayout<Int32>.size)
+            memset(style.dataPointer, 0, 256 * MemoryLayout<Float>.size)
+            memset(mask.dataPointer,  0, L * MemoryLayout<Float>.size)
             input = try MLDictionaryFeatureProvider(dictionary: [
-                "input_ids":       MLFeatureValue(multiArray: ids),
-                "style":           MLFeatureValue(multiArray: style),
-                "attention_mask":  MLFeatureValue(multiArray: mask),
+                "input_ids":      MLFeatureValue(multiArray: ids),
+                "style":          MLFeatureValue(multiArray: style),
+                "attention_mask": MLFeatureValue(multiArray: mask),
             ])
-        } else if let N = Self.bucketSize(name: name, prefix: "kitten_generator_N") {
+        } else {
+            let N = bucket
             let prosody = try MLMultiArray(shape: [1, 256, NSNumber(value: N)], dataType: .float32)
-            let text = try MLMultiArray(shape: [1, 128, NSNumber(value: N)], dataType: .float32)
-            let style = try MLMultiArray(shape: [1, 256], dataType: .float32)
-            Self.zeroFill(prosody, count: 256 * N, stride: MemoryLayout<Float>.size)
-            Self.zeroFill(text, count: 128 * N, stride: MemoryLayout<Float>.size)
-            Self.zeroFill(style, count: 256, stride: MemoryLayout<Float>.size)
+            let text    = try MLMultiArray(shape: [1, 128, NSNumber(value: N)], dataType: .float32)
+            let style   = try MLMultiArray(shape: [1, 256], dataType: .float32)
+            memset(prosody.dataPointer, 0, 256 * N * MemoryLayout<Float>.size)
+            memset(text.dataPointer,    0, 128 * N * MemoryLayout<Float>.size)
+            memset(style.dataPointer,   0, 256 * MemoryLayout<Float>.size)
             input = try MLDictionaryFeatureProvider(dictionary: [
                 "prosody_lr": MLFeatureValue(multiArray: prosody),
                 "text_lr":    MLFeatureValue(multiArray: text),
                 "style":      MLFeatureValue(multiArray: style),
             ])
-        } else {
-            return  // unknown model name, skip warmup
         }
         _ = try await model.prediction(from: input)
     }
 
-    private static func bucketSize(name: String, prefix: String) -> Int? {
-        guard name.hasPrefix(prefix) else { return nil }
-        return Int(name.dropFirst(prefix.count))
-    }
-
-    private static func zeroFill(_ a: MLMultiArray, count: Int, stride: Int) {
-        memset(a.dataPointer, 0, count * stride)
+    private static func resourceURL(name: String) -> (url: URL, isCompiled: Bool)? {
+        for ext in ["mlmodelc", "mlpackage"] {
+            if let u = Bundle.main.url(forResource: name, withExtension: ext) {
+                return (u, ext == "mlmodelc")
+            }
+        }
+        if let base = Bundle.main.resourceURL {
+            for ext in ["mlmodelc", "mlpackage"] {
+                let u = base.appendingPathComponent("coreml/\(name).\(ext)")
+                if FileManager.default.fileExists(atPath: u.path) { return (u, ext == "mlmodelc") }
+            }
+        }
+        return nil
     }
 
     /// Return a compiled `.mlmodelc` URL, reusing a cached copy if its mtime
-    /// matches the bundled `.mlpackage`'s manifest. First launch pays ~5s per
-    /// bucket to compile; subsequent launches are near-instant.
+    /// matches the bundled `.mlpackage`'s Manifest. First launch pays the
+    /// compile cost once per package.
     private static func compiledModelURL(packageURL: URL, name: String) async throws -> URL {
         let fm = FileManager.default
         let cacheRoot = try fm.url(for: .cachesDirectory, in: .userDomainMask,
@@ -443,39 +428,15 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
         let stamp = Int(pkgMtime.timeIntervalSince1970)
         let compiledURL = cacheRoot.appendingPathComponent("\(name)_\(stamp).mlmodelc", isDirectory: true)
         if fm.fileExists(atPath: compiledURL.path) { return compiledURL }
-
-        // Evict stale compiled copies for this bucket name.
         if let entries = try? fm.contentsOfDirectory(at: cacheRoot, includingPropertiesForKeys: nil) {
             for url in entries where url.lastPathComponent.hasPrefix("\(name)_") {
                 try? fm.removeItem(at: url)
             }
         }
         let freshlyCompiled = try await MLModel.compileModel(at: packageURL)
-        // `compileModel` returns a URL in the OS tmp dir; move it into the cache.
         try? fm.removeItem(at: compiledURL)
         try fm.moveItem(at: freshlyCompiled, to: compiledURL)
         return compiledURL
-    }
-
-    /// Locate a CoreML resource (precompiled .mlmodelc preferred, .mlpackage
-    /// fallback). Checks folder-reference paths (`coreml/<name>.<ext>`) and
-    /// flat layouts. Returns whichever exists.
-    private static func resourceURL(name: String) -> (url: URL, isCompiled: Bool)? {
-        for ext in ["mlmodelc", "mlpackage"] {
-            if let u = Bundle.main.url(forResource: name, withExtension: ext) {
-                return (u, ext == "mlmodelc")
-            }
-        }
-        // Xcode may preserve our "coreml/" subfolder as a folder reference.
-        if let base = Bundle.main.resourceURL {
-            for ext in ["mlmodelc", "mlpackage"] {
-                let u = base.appendingPathComponent("coreml/\(name).\(ext)")
-                if FileManager.default.fileExists(atPath: u.path) {
-                    return (u, ext == "mlmodelc")
-                }
-            }
-        }
-        return nil
     }
 
     private func loadVoices() throws {

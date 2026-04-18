@@ -60,8 +60,16 @@ def _sample_style() -> torch.Tensor:
     return torch.from_numpy(v["expr-voice-5-m"][32:33].astype(np.float32))
 
 
-def convert_text_stage(L: int, save: bool = True, out_dir: Path = OUT_DIR) -> None:
-    print(f"=== TextStage L={L} ===")
+def _precision(variant: str) -> ct.precision:
+    return {
+        "fp32": ct.precision.FLOAT32,
+        "fp16": ct.precision.FLOAT16,
+    }[variant]
+
+
+def convert_text_stage(L: int, save: bool = True, out_dir: Path = OUT_DIR,
+                       variant: str = "fp32") -> None:
+    print(f"=== TextStage L={L} variant={variant} ===")
     w = WeightBag.load("Sources/KittenApp/Resources/nano/kitten_tts_nano_v0_8.safetensors")
     stage = TextStage(w).eval()
 
@@ -92,9 +100,9 @@ def convert_text_stage(L: int, save: bool = True, out_dir: Path = OUT_DIR) -> No
         ],
         convert_to="mlprogram",
         minimum_deployment_target=ct.target.macOS15,
-        compute_precision=ct.precision.FLOAT32,
+        compute_precision=_precision(variant),
     )
-    mlmodel.short_description = f"KittenTTS text stage (L={L}, masked)"
+    mlmodel.short_description = f"KittenTTS text stage (L={L}, {variant})"
     if save:
         out = out_dir / f"kitten_text_L{L}.mlpackage"
         mlmodel.save(str(out))
@@ -103,8 +111,9 @@ def convert_text_stage(L: int, save: bool = True, out_dir: Path = OUT_DIR) -> No
 
 
 def convert_generator_stage(n_frames: int, save: bool = True,
-                            out_dir: Path = OUT_DIR) -> None:
-    print(f"=== GeneratorStage N={n_frames} ===")
+                            out_dir: Path = OUT_DIR,
+                            variant: str = "fp32") -> None:
+    print(f"=== GeneratorStage N={n_frames} variant={variant} ===")
     w = WeightBag.load("Sources/KittenApp/Resources/nano/kitten_tts_nano_v0_8.safetensors")
     stage = GeneratorStage(w).eval()
 
@@ -131,9 +140,9 @@ def convert_generator_stage(n_frames: int, save: bool = True,
         ],
         convert_to="mlprogram",
         minimum_deployment_target=ct.target.macOS15,
-        compute_precision=ct.precision.FLOAT32,
+        compute_precision=_precision(variant),
     )
-    mlmodel.short_description = f"KittenTTS generator stage (N={n_frames})"
+    mlmodel.short_description = f"KittenTTS generator stage (N={n_frames}, {variant})"
     if save:
         out = out_dir / f"kitten_generator_N{n_frames}.mlpackage"
         mlmodel.save(str(out))
@@ -153,19 +162,24 @@ def main():
                     help="TextStage bucket(s), comma-separated (e.g. '64,128,256')")
     ap.add_argument("-N", default="256",
                     help="GeneratorStage bucket(s), comma-separated")
-    ap.add_argument("--out", default=str(OUT_DIR), help="output directory")
+    ap.add_argument("--out", default=None,
+                    help="output directory (default: scripts/models/<variant>/)")
+    ap.add_argument("--variant", default="fp32", choices=["fp32", "fp16"],
+                    help="weight + activation precision")
     ap.add_argument("--no-save", action="store_true")
     args = ap.parse_args()
 
-    out_dir = Path(args.out)
+    out_dir = Path(args.out) if args.out else OUT_DIR / args.variant
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.which in ("text", "both"):
         for L in _parse_int_list(args.L):
-            convert_text_stage(L, save=not args.no_save, out_dir=out_dir)
+            convert_text_stage(L, save=not args.no_save, out_dir=out_dir,
+                               variant=args.variant)
     if args.which in ("generator", "both"):
         for N in _parse_int_list(args.N):
-            convert_generator_stage(N, save=not args.no_save, out_dir=out_dir)
+            convert_generator_stage(N, save=not args.no_save, out_dir=out_dir,
+                                    variant=args.variant)
 
 
 if __name__ == "__main__":

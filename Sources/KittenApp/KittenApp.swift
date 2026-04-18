@@ -96,11 +96,22 @@ struct KittenTTSView: View {
     @State private var isGenerating: Bool = false
     @State private var status: String = "Loading model..."
     @State private var modelReady: Bool = false
-    // Voice + backend persist across launches; speed is session-only.
+    // Voice + backend + variant + compute persist; speed is session-only.
     @AppStorage("voice")   private var voice: String = "Kiki"
     @AppStorage("backend") private var backend: Backend = .coreml
+    @AppStorage("variant") private var variantRaw: String = KittenTTSCoreML.Variant.int8w.rawValue
+    @AppStorage("compute") private var computeRaw: String = KittenTTSCoreML.Compute.all.rawValue
     @State private var speed: Float = 1.0
     @StateObject private var log = MetricsLog()
+
+    private var variant: KittenTTSCoreML.Variant {
+        get { KittenTTSCoreML.Variant(rawValue: variantRaw) ?? .int8w }
+        nonmutating set { variantRaw = newValue.rawValue }
+    }
+    private var compute: KittenTTSCoreML.Compute {
+        get { KittenTTSCoreML.Compute(rawValue: computeRaw) ?? .all }
+        nonmutating set { computeRaw = newValue.rawValue }
+    }
 
     private let mlxTTS = KittenTTS()
     private let coreMLTTS = KittenTTSCoreML()
@@ -138,6 +149,30 @@ struct KittenTTSView: View {
                         .pickerStyle(.segmented)
                         .frame(maxWidth: 200)
                         .disabled(isGenerating)
+                    }
+                    HStack {
+                        Text("Variant").font(.caption).foregroundColor(.secondary)
+                        Spacer()
+                        Picker("", selection: $variantRaw) {
+                            ForEach(KittenTTSCoreML.Variant.allCases, id: \.rawValue) { v in
+                                Text(v.rawValue).tag(v.rawValue)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 240)
+                        .disabled(isGenerating || backend == .mlx)
+                    }
+                    HStack {
+                        Text("Compute").font(.caption).foregroundColor(.secondary)
+                        Spacer()
+                        Picker("", selection: $computeRaw) {
+                            ForEach(KittenTTSCoreML.Compute.allCases, id: \.rawValue) { c in
+                                Text(c.rawValue).tag(c.rawValue)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 160)
+                        .disabled(isGenerating || backend == .mlx)
                     }
                     HStack {
                         Text("Speed").font(.caption).foregroundColor(.secondary)
@@ -216,6 +251,15 @@ struct KittenTTSView: View {
         .onChange(of: backend) { _, newValue in
             Task { await switchBackend(to: newValue) }
         }
+        .onChange(of: variantRaw) { _, _ in
+            // Variant / compute changes invalidate the loaded MLModel set.
+            coreMLTTS.unload()
+            log.info("variant → \(variantRaw)  (unloaded CoreML models)")
+        }
+        .onChange(of: computeRaw) { _, _ in
+            coreMLTTS.unload()
+            log.info("compute → \(computeRaw)  (unloaded CoreML models)")
+        }
     }
 
     private static let timeFmt: DateFormatter = {
@@ -251,9 +295,10 @@ struct KittenTTSView: View {
             let audioS = Double(m.samples) / 24000.0
             let totalMs = m.textStageMs + m.generatorStageMs
             let rtf = audioS / (totalMs / 1000.0)
+            let tag = "\(m.variant.rawValue)/\(m.compute.rawValue)"
             Task { @MainActor in
                 log?.metric(String(format:
-                    "CoreML chunk   phonemes=%d L=%d N=%d  text %.0fms gen %.0fms  audio %.2fs  RTF %.1fx",
+                    "CoreML/\(tag) chunk  phonemes=%d L=%d N=%d  text %.0fms gen %.0fms  audio %.2fs  RTF %.1fx",
                     m.phonemes, m.bucketL, m.bucketN,
                     m.textStageMs, m.generatorStageMs, audioS, rtf))
             }
@@ -344,7 +389,10 @@ struct KittenTTSView: View {
                     totalSamples = s.count
                 case .coreml:
                     let cfg = KittenTTSCoreML.Config(speed: capturedSpeed, voiceID: voice)
-                    let s = try await coreMLTTS.speak(text: text, config: cfg, callback: cb)
+                    let s = try await coreMLTTS.speak(
+                        text: text, config: cfg,
+                        variant: variant, compute: compute,
+                        callback: cb)
                     totalSamples = s.count
                 }
                 let totalMs = Date().timeIntervalSince(startTime) * 1000

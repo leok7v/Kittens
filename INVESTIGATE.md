@@ -432,11 +432,22 @@ All four function shapes produce correct outputs from the one file.
 - [ ] Re-quantize `int8w` on top of fp16 conversion (not fp32) for
       ANE-native compression; may change size/quality slightly vs
       current.
-- [ ] `int8wa` calibration:
-      - [ ] Harvard-sentences corpus in `scripts/calibration/`.
-      - [ ] `scripts/calibrate_and_quantize.py` that generates calib
-            tuples + runs `linear_quantize_activations`.
-      - [ ] Produce per-bucket int8wa mlpackages.
+- [x] `int8wa` calibration — **blocked by coremltools bug**. Wrote
+      `scripts/calibrate_and_quantize.py` and tested on L=16 bucket.
+      `cto.linear_quantize_activations` crashes with:
+      `ValueError: in op quantize, named input scale must have same
+      dtype as input. scale has dtype fp32 whereas input has dtype int32.`
+      Root cause: the TextStage has `input_ids: int32` going through
+      `F.embedding`, producing float outputs. coremltools' pass tries
+      to quantize the embedding-lookup op's int32 input, generating an
+      fp32 scale tensor and hitting the dtype validator.
+      `op_selector` is the documented filter hook but is **deprecated**
+      in current coremltools (raises "op_selector is supported only
+      through the coremltools.compression_utils API"). Workaround
+      would be via `op_type_configs` with per-type fine-grained control
+      — significant work for uncertain quality gain.
+      **Deferred.** Three variants (fp32/fp16/int8w) cover the A/B
+      matrix for now.
 - [ ] Merge all variants into multifunction files. Final artifact set
       (to copy into `Sources/KittenApp/Resources/coreml/`):
       - `kitten_text_fp32.mlpackage`
@@ -462,6 +473,58 @@ All four function shapes produce correct outputs from the one file.
 scripts exist (`build_multifunction.py`), int8w multifunction files
 are built and runtime-tested. fp32 / fp16 / int8wa variants, Swift
 loader changes, and UI pickers are NOT YET IMPLEMENTED.
+
+---
+
+**Update (follow-up commit)**: Plan B execution continued. All three
+working variants are now bundled and wired end-to-end:
+
+- `scripts/convert_to_coreml.py` now takes `--variant fp32|fp16` and
+  writes into `scripts/models/<variant>/`. Converted 5 text × 4 gen
+  buckets at both precisions.
+- `scripts/quantize_coreml.py` derives `int8w` from `fp32` input via
+  `linear_quantize_weights`.
+- `scripts/build_multifunction.py` merges 5 text shapes + 4 gen shapes
+  per variant into 6 multifunction files.
+- `scripts/calibrate_and_quantize.py` exists but blocked — see the
+  int8wa row in checklist above.
+- `Sources/KittenApp/Resources/coreml/` now contains the 6 shipped
+  multifunction mlpackages (fp32 / fp16 / int8w, text + generator).
+- `Sources/KittenApp/TTS.CoreML.swift` rewritten: one MLModel per
+  `(stage, variant, compute, bucket)` cached lazily. Uses
+  `MLModelConfiguration.functionName = "L_\(bucket)"` /
+  `"N_\(bucket)"` to pick a function from the multifunction file.
+- `Sources/KittenApp/KittenApp.swift` adds **Variant** + **Compute**
+  pickers with `@AppStorage`. Disabled when Backend = MLX. Switching
+  variant or compute calls `coreMLTTS.unload()` to drop the old
+  MLModel instances.
+- Log line for CoreML chunks now includes variant/compute tag:
+  `CoreML/fp16/All chunk  phonemes=78 L=128 N=256  text ... gen ...`.
+
+**Bundled sizes (`Build/Products/Debug/KittenApp.app/Contents/Resources/`):**
+
+| file                               | size   |
+|------------------------------------|--------|
+| `kitten_text_fp32.mlmodelc`        | 27 MB  |
+| `kitten_text_fp16.mlmodelc`        | 14 MB  |
+| `kitten_text_int8w.mlmodelc`       | 7.4 MB |
+| `kitten_generator_fp32.mlmodelc`   | 30 MB  |
+| `kitten_generator_fp16.mlmodelc`   | 16 MB  |
+| `kitten_generator_int8w.mlmodelc`  | 9.1 MB |
+| **total CoreML**                   | **104 MB** |
+| nano safetensors (MLX)             | 22 MB  |
+| voices.safetensors                 | 3 MB   |
+| mlx.metallib + mlx-swift bundle    | 7 MB   |
+| **Debug Swift dylib**              | 43 MB  |
+| **total app bundle**               | **179 MB (Debug)** |
+
+Release build should drop dylib to ~5 MB → ~140 MB. Further cleanup
+by pruning losing variants after A/B.
+
+Builds pass on macOS and iOS. Runtime smoke test: app launches,
+voice/backend/variant/compute pickers persist via @AppStorage, UI
+enabled/disabled logic works. Actual variant × compute grid numbers
+not yet measured — that's the next step on device.
 
 ---
 
