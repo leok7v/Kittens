@@ -32,9 +32,15 @@ import numpy as np
 import coremltools as ct
 import coremltools.optimize.coreml as cto
 
-SRC_DIR = Path("scripts/models/fp32")
+# coremltools' linear_quantize_activations emits fp16 scale values, so the
+# source model must already be fp16 — an fp32 source fails the validator
+# with "scale has dtype fp16 whereas input has dtype fp32".
+SRC_DIR = Path("scripts/models/fp16")
 DST_DIR = Path("scripts/models/int8wa")
 VOICES_NPZ = Path("scripts/models/voices.npz")
+# Real (prosody_lr, text_lr, style) tuples produced by real_calibration.py.
+# Each N-bucket subdir holds one .npz per sample.
+CALIB_TUPLES_DIR = Path("scripts/models/calibration_tuples")
 
 N_CALIB = 32
 
@@ -49,6 +55,26 @@ def _voices_sample(k: int, rng: np.random.Generator) -> np.ndarray:
 
 
 def _text_calibration(L: int, n: int, rng: np.random.Generator) -> list[dict]:
+    """Load real phonemized (input_ids, style, attention_mask) tuples.
+    Falls back to random IDs if real_calibration.py hasn't been run yet —
+    random phonemes are structurally similar enough to train *weights*
+    but not *duration* heads, so prefer real samples when available.
+    """
+    bucket_dir = CALIB_TUPLES_DIR / f"L{L}"
+    if bucket_dir.exists() and any(bucket_dir.glob("sample_*.npz")):
+        paths = sorted(bucket_dir.glob("sample_*.npz"))
+        chosen = paths[: n]
+        samples: list[dict] = []
+        for p in chosen:
+            z = np.load(p)
+            samples.append({
+                "input_ids":      z["input_ids"].astype(np.int32),
+                "style":          z["style"].reshape(1, 256).astype(np.float32),
+                "attention_mask": z["attention_mask"].astype(np.float32),
+            })
+        return samples
+
+    # Fallback (legacy path). Used only if real_calibration.py absent.
     samples = []
     styles = _voices_sample(n, rng)
     for i in range(n):
@@ -66,23 +92,38 @@ def _text_calibration(L: int, n: int, rng: np.random.Generator) -> list[dict]:
 
 
 def _generator_calibration(N: int, n: int, rng: np.random.Generator) -> list[dict]:
-    """Synthetic generator inputs. The real distribution of prosody_lr /
-    text_lr depends on upstream stages; a Gaussian approximation is
-    usually fine for activation calibration of the generator's own
-    activations. Mean/std pulled from a one-shot real run in the past."""
-    # Rough empirical stats from a real TextStage + length-reg run:
-    prosody_mean, prosody_std = -0.03, 1.65
-    text_mean, text_std = 0.00, 0.24
-    samples = []
-    styles = _voices_sample(n, rng)
-    for i in range(n):
-        prosody = rng.normal(prosody_mean, prosody_std, (1, 256, N)).astype(np.float32)
-        text = rng.normal(text_mean, text_std, (1, 128, N)).astype(np.float32)
+    """Load real length-regulated tuples produced by real_calibration.py.
+
+    Gaussians proved insufficient: the generator's activation stats depend
+    strongly on the repeated-frame / zero-tail structure that length
+    regulation creates, not just marginal mean/std. Bad calibration = bad
+    scales = distorted audio (slow robotic / cave echo / whisper).
+
+    `n` is a ceiling; we use whatever real tuples exist for this bucket.
+    """
+    bucket_dir = CALIB_TUPLES_DIR / f"N{N}"
+    if not bucket_dir.exists():
+        raise SystemExit(
+            f"missing {bucket_dir}; run real_calibration.py first")
+    paths = sorted(bucket_dir.glob("sample_*.npz"))
+    if not paths:
+        raise SystemExit(
+            f"no real calibration samples in {bucket_dir}")
+    chosen = paths[: n] if len(paths) > n else paths
+    samples: list[dict] = []
+    for p in chosen:
+        z = np.load(p)
         samples.append({
-            "prosody_lr": prosody,
-            "text_lr":    text,
-            "style":      styles[i],
+            "prosody_lr": z["prosody_lr"].astype(np.float32),
+            "text_lr":    z["text_lr"].astype(np.float32),
+            "style":      z["style"].reshape(1, 256).astype(np.float32),
         })
+    # Pad with rng-picked repeats if we have fewer than n samples (keeps
+    # downstream code's expectation of at least a handful; repetition is
+    # harmless — the quantizer already saw the same stats once).
+    if len(samples) < 4 and rng is not None:  # cheap minimum
+        while len(samples) < 4:
+            samples.append(samples[rng.integers(0, len(samples))])
     return samples
 
 
@@ -93,24 +134,22 @@ def quantize_one(src: Path, dst: Path, calib: list[dict]) -> tuple[int, int]:
     model = ct.models.MLModel(str(src))
 
     # Step 1: quantize activations with calibration.
-    # Skip ops whose inputs are non-float (e.g. embedding lookup from int32
-    # input_ids) — coremltools' quantize pass has a bug there, inserting an
-    # fp32 scale on an int32 tensor and failing the validator.
-    def op_selector(op) -> bool:
-        for x in op.inputs.values():
-            if isinstance(x, (list, tuple)):
-                xs = x
-            else:
-                xs = [x]
-            for v in xs:
-                dt = getattr(v, "dtype", None)
-                if dt is not None and "int" in str(dt):
-                    return False
-        return True
-
+    # Attempt #2 workaround: whitelist only the ops where activation
+    # quantization is well-defined. `gather` (embedding lookup) takes int32
+    # indices — coremltools tries to insert an fp32 scale on that int32
+    # input and hits a dtype validator. Deprecated `op_selector` is the
+    # documented filter but is disabled in ct 9. Using per-op-type config
+    # with `global_config=None` restricts quantization to the named types.
+    linear_cfg = cto.OpLinearQuantizerConfig(mode="linear_symmetric")
     act_cfg = cto.OptimizationConfig(
-        global_config=cto.OpLinearQuantizerConfig(mode="linear_symmetric"),
-        op_selector=op_selector,
+        global_config=None,
+        op_type_configs={
+            "linear": linear_cfg,
+            "matmul": linear_cfg,
+            "conv":   linear_cfg,
+            # Omit lstm/gather/softmax/etc — they either can't be quantized
+            # cleanly or break the validator.
+        },
     )
     print(f"    step 1/2: activation calibration on {len(calib)} samples ...")
     model_a8 = cto.linear_quantize_activations(

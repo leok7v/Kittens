@@ -31,6 +31,7 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
         case fp32
         case fp16
         case int8w
+        case int8wa
     }
 
     public enum Compute: String, Sendable, CaseIterable {
@@ -248,10 +249,20 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
         }
 
         let wavFlat = try Self.copyToFloat32(wav)
-        let realSamples = totalFrames * Self.audioPerFrame * 2
+        // The generator's decoder has non-causal convolutions: its output
+        // for the last few real frames is perturbed by the zero-padded
+        // frames immediately after. Drop those frames (tailDropFrames)
+        // before the fade-out so we discard the artifact region entirely.
+        // `max(1, raw)` already minimally pads trailing punctuation with
+        // silence-duration frames, so clipping a couple of frames off the
+        // end costs no speech content.
+        let tailDropFrames = 3
+        let trimFrames = max(0, totalFrames - tailDropFrames)
+        let realSamples = trimFrames * Self.audioPerFrame * 2
         let take = min(realSamples, wavFlat.count)
         var output = Array(wavFlat.prefix(take))
-        Self.applyTailFade(&output, fadeSamples: 240)
+        Self.applyFadeIn(&output,  fadeSamples: 72)    // 3 ms
+        Self.applyFadeOut(&output, fadeSamples: 960)   // 40 ms
         let generatorStageMs = Date().timeIntervalSince(tGenStart) * 1000.0
         onChunkMetrics?(ChunkMetrics(
             phonemes: realL, bucketL: L, bucketN: nBucket,
@@ -261,14 +272,25 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
         return output
     }
 
-    /// Cosine fade the last `fadeSamples` of `samples` from 1× down to 0.
-    private static func applyTailFade(_ samples: inout [Float], fadeSamples: Int) {
+    /// Cosine fade from 0 → 1 over the first `fadeSamples` of `samples`.
+    private static func applyFadeIn(_ samples: inout [Float], fadeSamples: Int) {
+        let n = min(fadeSamples, samples.count)
+        guard n > 0 else { return }
+        for i in 0..<n {
+            let t = Float(i) / Float(n - 1 > 0 ? n - 1 : 1)
+            let gain = 0.5 - 0.5 * cos(.pi * t)   // 0 at i=0, 1 at i=n-1
+            samples[i] *= gain
+        }
+    }
+
+    /// Cosine fade from 1 → 0 over the last `fadeSamples` of `samples`.
+    private static func applyFadeOut(_ samples: inout [Float], fadeSamples: Int) {
         let n = min(fadeSamples, samples.count)
         guard n > 0 else { return }
         let start = samples.count - n
         for i in 0..<n {
             let t = Float(i) / Float(n - 1 > 0 ? n - 1 : 1)
-            let gain = 0.5 + 0.5 * cos(.pi * t)
+            let gain = 0.5 + 0.5 * cos(.pi * t)   // 1 at i=0, 0 at i=n-1
             samples[start + i] *= gain
         }
     }

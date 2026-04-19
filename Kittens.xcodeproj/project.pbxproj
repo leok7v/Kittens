@@ -6,12 +6,17 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		B31B6A692F9441990051B68E /* MLX in Frameworks */ = {isa = PBXBuildFile; productRef = B3F355B12F905000001258AE /* MLX */; };
+		B31B6A6A2F9441990051B68E /* MLXNN in Frameworks */ = {isa = PBXBuildFile; productRef = B3F355B22F905000001258AE /* MLXNN */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		B3F355972F904FAC001258AE /* KittenApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = KittenApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		B3F355992F904FAC001258AE /* KittenApp */ = {
+		B3F355992F904FAC001258AE /* Sources/KittenApp */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = Sources/KittenApp;
 			sourceTree = "<group>";
@@ -23,6 +28,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B31B6A6A2F9441990051B68E /* MLXNN in Frameworks */,
+				B31B6A692F9441990051B68E /* MLX in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -32,7 +39,7 @@
 		B3F3558E2F904FAC001258AE = {
 			isa = PBXGroup;
 			children = (
-				B3F355992F904FAC001258AE /* KittenApp */,
+				B3F355992F904FAC001258AE /* Sources/KittenApp */,
 				B3F355982F904FAC001258AE /* Products */,
 			);
 			sourceTree = "<group>";
@@ -61,7 +68,7 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				B3F355992F904FAC001258AE /* KittenApp */,
+				B3F355992F904FAC001258AE /* Sources/KittenApp */,
 			);
 			name = KittenApp;
 			packageProductDependencies = (
@@ -254,7 +261,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 692R843P25;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_INCOMING_NETWORK_CONNECTIONS = NO;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
@@ -268,12 +275,11 @@
 				ENABLE_RESOURCE_ACCESS_PRINTING = NO;
 				ENABLE_RESOURCE_ACCESS_USB = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/Sources/KittenApp/CEPhonemizer",
 					"$(SRCROOT)/Sources/KittenApp/CEPhonemizer/include",
 				);
-				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Sources/KittenApp/KittenApp-Bridging-Header.h";
-				GENERATE_INFOPLIST_FILE = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -297,6 +303,7 @@
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Sources/KittenApp/KittenApp-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = "1,2,7";
@@ -326,12 +333,11 @@
 				ENABLE_RESOURCE_ACCESS_PRINTING = NO;
 				ENABLE_RESOURCE_ACCESS_USB = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/Sources/KittenApp/CEPhonemizer",
 					"$(SRCROOT)/Sources/KittenApp/CEPhonemizer/include",
 				);
-				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Sources/KittenApp/KittenApp-Bridging-Header.h";
-				GENERATE_INFOPLIST_FILE = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -355,6 +361,7 @@
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Sources/KittenApp/KittenApp-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = "1,2,7";

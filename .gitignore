@@ -7,6 +7,7 @@ Build/
 xcuserdata/
 DerivedData/
 *.wav
+tmp/
 *.o
 *.d
 .DS_Store
@@ -24,3 +25,5 @@ __pycache__/
 # The canonical .mlpackages the Swift app loads live in
 # Sources/KittenTTS/Resources/coreml/ and ARE tracked.
 scripts/models/
+KittenML/
+.claude/

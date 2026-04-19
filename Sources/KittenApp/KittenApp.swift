@@ -8,7 +8,22 @@ import AppKit
 import UIKit
 #endif
 
+/// App entry point. When invoked with `--bench`, we run a headless benchmark
+/// and exit without bringing up SwiftUI. Otherwise we hand off to the app.
 @main
+enum AppEntryPoint {
+    static func main() async {
+        #if os(macOS)
+        let args = CommandLine.arguments
+        if args.contains("--bench") {
+            await KittenBench.run(args: args)
+            exit(0)
+        }
+        #endif
+        KittenApp.main()
+    }
+}
+
 struct KittenApp: App {
     init() {
         #if os(macOS)

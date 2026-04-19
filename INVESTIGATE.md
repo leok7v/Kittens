@@ -432,22 +432,28 @@ All four function shapes produce correct outputs from the one file.
 - [ ] Re-quantize `int8w` on top of fp16 conversion (not fp32) for
       ANE-native compression; may change size/quality slightly vs
       current.
-- [x] `int8wa` calibration — **blocked by coremltools bug**. Wrote
-      `scripts/calibrate_and_quantize.py` and tested on L=16 bucket.
-      `cto.linear_quantize_activations` crashes with:
-      `ValueError: in op quantize, named input scale must have same
-      dtype as input. scale has dtype fp32 whereas input has dtype int32.`
-      Root cause: the TextStage has `input_ids: int32` going through
-      `F.embedding`, producing float outputs. coremltools' pass tries
-      to quantize the embedding-lookup op's int32 input, generating an
-      fp32 scale tensor and hitting the dtype validator.
-      `op_selector` is the documented filter hook but is **deprecated**
-      in current coremltools (raises "op_selector is supported only
-      through the coremltools.compression_utils API"). Workaround
-      would be via `op_type_configs` with per-type fine-grained control
-      — significant work for uncertain quality gain.
-      **Deferred.** Three variants (fp32/fp16/int8w) cover the A/B
-      matrix for now.
+- [x] `int8wa` calibration — **working after two attempts**.
+      `scripts/calibrate_and_quantize.py` now produces all 9 int8wa
+      mlpackages. Two changes vs. the first-attempt blockers:
+
+      1. Source the calibration from the **fp16** converted model, not
+         fp32. coremltools' `linear_quantize_activations` emits fp16
+         `scale` values; an fp32 source tensor triggers a dtype
+         validator (`scale has dtype fp16 whereas input has dtype fp32`).
+
+      2. Use `op_type_configs` with `global_config=None` and an explicit
+         whitelist (`linear`, `matmul`, `conv`) instead of trying to
+         quantize everything. Filters out `gather` (embedding lookup
+         with int32 indices — the first-attempt blocker) and leaves
+         softmax / layernorm / lstm in fp16.
+
+      Sizes: text 6.6 MB/bucket, generator 7.8 MB/bucket. Multifunction
+      merged: `kitten_text_int8wa.mlpackage` = 7.9 MB,
+      `kitten_generator_int8wa.mlpackage` = 9.7 MB.
+
+      Calibration cost: N=32 samples per text bucket + N=16 samples per
+      generator bucket (reduced from 32 for N≥512 to keep runtime
+      manageable; N=1024 × 32 samples took ~30 min and was killed).
 - [ ] Merge all variants into multifunction files. Final artifact set
       (to copy into `Sources/KittenApp/Resources/coreml/`):
       - `kitten_text_fp32.mlpackage`
@@ -566,13 +572,99 @@ chunks for lower latency." (78 phonemes).
 | ORT (ref, KittenML impl)            | 265 MB    | —          | ~8×       | —          | —         | instant          | baseline |
 | MLX                                 | 1315 MB   | 1315 MB    | 10.6×     | 2.2×       | 6.19 s    | 625 ms           | existing |
 | CoreML, pre-investigation, int8w/ANE| 900 MB    | 1669 MB    | 22×       | 1.8× warm  | 6.40 s    | 48 s cold        | ours today |
-| CoreML fp32 / ANE                   |           |            |           |            |           |                  |      |
-| CoreML fp32 / CPU                   |           |            |           |            |           |                  |      |
-| CoreML fp16 / ANE                   |           |            |           |            |           |                  |      |
-| CoreML fp16 / CPU                   |           |            |           |            |           |                  |      |
-| CoreML int8w / ANE                  |           |            |           |            |           |                  |      |
-| CoreML int8w / CPU                  |           |            |           |            |           |                  |      |
-| CoreML int8wa / CPU (target=ORT)    |           |            |           |            |           |                  |      |
+
+**Post-Plan-B macOS measurements** (phrase: "Kitten TTS is now streaming
+audio chunks for lower latency.", 78 phonemes, L=128 / N=256 buckets).
+Baseline RAM: 31 MB before any model. RAM stays ~38–50 MB throughout
+because only one variant × compute × bucket pair is loaded at a time.
+
+| variant × compute | load   | warmup | warm text | warm gen | warm total | warm RTF | cold total | cold RTF | quality |
+|---|---|---|---|---|---|---|---|---|---|
+| **int8w / All** (ANE)   | 254 ms | 1647 ms | 69 ms | 162 ms | **265 ms** | **18.0×** | 2151 ms | 2.2×  | OK |
+| fp16  / All (ANE)       | 259 ms | 103 ms  | 41 ms | 125 ms | 568 ms     | 8.4×     | —       | —     | OK |
+| fp32  / All (ANE)       | 234 ms | 208 ms  | 50 ms | 134 ms | 668 ms     | 7.2×     | —       | —     | OK |
+| fp32  / CPU             | 221 ms | 189 ms  | 52 ms | 158 ms | 660 ms     | 7.3×     | —       | —     | OK |
+| fp16  / CPU             | 223 ms |  93 ms  | 40 ms | 120 ms | 512 ms     | 9.4×     | —       | —     | **broken audio** |
+| int8w / CPU             | 239 ms | 190 ms  | 52 ms | 159 ms | 680 ms     | 7.0×     | —       | —     | OK |
+
+Peak resident memory during the matrix switch: ~50 MB. **~18× less
+than pre-Plan-B** (900 MB → 50 MB) and **~5× less than ORT**.
+
+Key findings so far:
+
+- `int8w / All` is the fastest config (warm RTF 18×) and also the
+  smallest on disk (~9 MB generator mlpackage). Matches our goals.
+- `fp16 / CPU` produces corrupted audio — probably a coremltools
+  issue with fp16 CPU kernels. Not worth chasing if int8w/All wins
+  the A/B.
+- Three of six (fp32 ANE/CPU, int8w CPU) cluster around RTF 7–9×,
+  similar to ORT's baseline. ANE fp16 is faster but identical quality.
+- Tail-click fix strengthened: 3 ms cosine fade-in + 20 ms fade-out
+  per chunk (was 10 ms fade-out only). Addresses both end-of-utterance
+  and between-chunk seams when multi-sentence text splits into
+  multiple chunks. Earlier fade may have been too short for int8
+  variants whose output has marginally different tail amplitude.
+- Very old iPhones (pre-Neural-Engine) run without crashing but
+  produce **no audio**. Suspected: audio playback path issue, not a
+  model issue. Separate investigation.
+
+**int8wa added as 4th variant (all 8 configs now available for A/B).**
+Bundled sizes:
+
+| file                              | size    |
+|-----------------------------------|---------|
+| `kitten_text_int8wa.mlmodelc`     | 7.9 MB  |
+| `kitten_generator_int8wa.mlmodelc`| 9.7 MB  |
+
+Total app bundle on macOS Debug: ~196 MB (was 179 MB). Release build
+should still land around 140 MB. int8wa is mostly orthogonal to the
+others since its activations actually stay int8 at inference; it's the
+only variant that matches ORT's numerical shape exactly.
+
+Matrix for the final A/B run (user to populate from on-device):
+
+|                              | macOS warm RTF | macOS cold | iPhone RTF | iPhone RAM | Audio OK? |
+|------------------------------|----------------|------------|-----------|------------|-----------|
+| MLX                          | 10.6×          | 625 ms     | 2.2×      | 1315 MB    | yes       |
+| CoreML / fp32  / All         | 7.2×           | 668 ms     |           |            | yes       |
+| CoreML / fp16  / All         | 8.4×           | 568 ms     |           |            | yes       |
+| CoreML / int8w / All         | **18.0×**      | 2151 ms    |           |            | **yes**   |
+| CoreML / int8wa/ All         | 18.9×          | **38461 ms** |         |            | **distorted — echoey** |
+| CoreML / fp32  / CPU         | 7.3×           | 660 ms     |           |            | yes       |
+| CoreML / fp16  / CPU         | 9.4×           | 512 ms     |           |            | **broken** |
+| CoreML / int8w / CPU         | 7.0×           | 680 ms     |           |            | yes       |
+| CoreML / int8wa/ CPU (=ORT)  | 23.9×          | 2223 ms    |           |            | **distorted — whispering** |
+
+**int8wa quality turned out bad** on both ANE and CPU. Speeds are
+competitive (warm 18–24×) but the audio is audibly wrong:
+
+- CPU: "whispering, highly distorted".
+- ANE: "echoing like in a cave".
+- Cold first-speak on ANE is **38 s** (ANE JIT for a quantized mixed-op
+  graph is expensive), making it unusable even if quality improved.
+
+Root-cause hypothesis: our **calibration is synthetic** — the generator
+calibration samples are Gaussian noise with crude empirical mean/std
+approximations (see `_generator_calibration` in
+`scripts/calibrate_and_quantize.py`). Real `prosody_lr`/`text_lr`
+tensors produced by the fp32 TextStage + length regulation have
+structured distributions (peaks at phoneme boundaries, silence
+valleys, different per-channel ranges). Activation ranges computed
+from Gaussian noise mismatch the real inference distribution enough
+to push quantization outside usable precision.
+
+To fix properly would require: run real sentences through the fp32
+TextStage in Python (via `torch_kitten.py`), do Swift-equivalent
+length regulation, dump per-sentence `(prosody_lr, text_lr, style)`
+tuples matching each bucket N, then re-calibrate. Significant effort
+for a variant whose only advantage was "matches ORT exactly" — and
+int8w/All already crushes ORT on both RAM and RTF.
+
+**Decision**: `int8wa` stays shipped as a 4th variant for reference
+but is **not the winner**. Winner is `CoreML / int8w / All` on both
+speed (RTF 18×) and quality. `int8wa` can be revisited if a future
+need demands INT8 activations (e.g., a watchOS target where fp16
+activation memory matters more).
 
 ---
 
