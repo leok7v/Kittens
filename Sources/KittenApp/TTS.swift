@@ -33,8 +33,10 @@ public final nonisolated class KittenTTS: @unchecked Sendable {
         "expr-voice-4-m": 0.9, "expr-voice-4-f": 0.8,
         "expr-voice-5-m": 0.8, "expr-voice-5-f": 0.8,
     ]
+    // Ordered by subjective cleanness (informal listening): Hugo and Luna
+    // ship the cleanest prosody on the current models, so they lead.
     public static let voiceDisplayOrder: [String] = [
-        "Leo", "Bella", "Jasper", "Luna", "Bruno", "Rosie", "Hugo", "Kiki",
+        "Hugo", "Luna", "Kiki", "Leo", "Bella", "Jasper", "Bruno", "Rosie",
     ]
 
     public init() {
@@ -54,13 +56,19 @@ public final nonisolated class KittenTTS: @unchecked Sendable {
 
     /// Copy bundled mlx.metallib next to the running binary so MLX's
     /// colocated-search finds it without any env vars or path hacks.
-    /// Used when running a CLI binary from SwiftPM; the Xcode app flow
-    /// relies on mlx-swift's own bundling and this becomes a no-op.
+    ///
+    /// Needed only for the bare-executable SwiftPM CLI layout
+    /// (`.build/…/debug/KittenApp` — no surrounding `.app`). Inside a
+    /// macOS `.app`, mlx-swift's own `mlx-swift_Cmlx.bundle` already
+    /// ships `default.metallib` where MLX expects it, and an extra copy
+    /// next to the executable just creates an unsigned file that trips
+    /// the incremental CodeSign phase on subsequent builds.
     // Called at-most-once from the single-threaded init() path; unsafe is fine.
     private nonisolated(unsafe) static var metalLibInstalled = false
     private static func installMetalLib() {
         guard !metalLibInstalled else { return }
         metalLibInstalled = true
+        if Bundle.main.bundleURL.pathExtension == "app" { return }
         guard let src = Bundle.main.url(forResource: "mlx", withExtension: "metallib") else { return }
         let binDir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
         let dst = binDir.appendingPathComponent("mlx.metallib")
@@ -125,7 +133,9 @@ public final nonisolated class KittenTTS: @unchecked Sendable {
             let chunks = TextChunker.chunk(normalised)
             var allAudio: [Float] = []
 
-            for chunk in chunks {
+            let gap = [Float](repeating: 0, count: Int(0.12 * 24000))
+
+            for (idx, chunk) in chunks.enumerated() {
                 let phonemes = try Phonemizer.phonemize(chunk)
                 let inputIds = MLXArray(phonemes.map { Int32($0) }).reshaped([1, -1])
                 let refId = min(chunk.count, voiceEmbeds.dim(0) - 1)
@@ -145,13 +155,14 @@ public final nonisolated class KittenTTS: @unchecked Sendable {
                     elapsedMs: elapsedMs,
                     samples: samples.count))
 
+                let emit: [Float] = idx == 0 ? samples : gap + samples
                 if let cb = callback {
-                    let int16Samples = samples.map { Int16(clamping: Int(round($0 * 32767.0))) }
+                    let int16Samples = emit.map { Int16(clamping: Int(round($0 * 32767.0))) }
                     int16Samples.withUnsafeBufferPointer { buffer in
                         if let baseAddress = buffer.baseAddress { cb(baseAddress, buffer.count) }
                     }
                 }
-                allAudio.append(contentsOf: samples)
+                allAudio.append(contentsOf: emit)
             }
             return allAudio
         }
@@ -374,36 +385,76 @@ enum TextPreprocessor {
 // MARK: - Chunker
 
 struct TextChunker {
-    /// Matches upstream Python `chunk_text` + `ensure_punctuation`.
+    /// Split text into sentences suitable for independent TTS generation.
+    ///
+    /// Earlier versions batched several sentences into one chunk to fit the
+    /// model's 400-character budget — but the LSTM duration head smeared
+    /// prosody across the batched boundary. A short leading "Yes." followed
+    /// by a longer follow-up was pronounced as a single elongated word.
+    ///
+    /// Now every sentence is its own chunk. The caller streams them one at
+    /// a time, and the natural sentence-final intonation of each short line
+    /// is preserved. Paragraph breaks (blank lines) are collapsed — the
+    /// caller inserts the pause between paragraphs itself.
     static func chunk(_ text: String, maxLen: Int = 400) -> [String] {
-        // Split on sentence-ending punctuation (Python: re.split(r'[.!?]+', text))
-        let regex = try! NSRegularExpression(pattern: "[.!?]+", options: [])
-        let sentences = regex.stringByReplacingMatches(
-            in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "\0")
-            .components(separatedBy: "\0")
         var chunks: [String] = []
-        var current = ""
-        for s in sentences {
-            let trimmed = s.trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty { continue }
-            let sentence = ensurePunctuation(trimmed)
-            if current.isEmpty {
-                current = sentence
-            } else if current.count + 1 + sentence.count <= maxLen {
-                current += " " + sentence
-            } else {
-                chunks.append(current)
-                current = sentence
-            }
+        for paragraph in text.components(separatedBy: "\n\n") {
+            let para = paragraph.trimmingCharacters(in: .whitespacesAndNewlines)
+            if para.isEmpty { continue }
+            let normalized = para.replacingOccurrences(of: "\n", with: " ")
+            chunks.append(contentsOf: splitSentences(normalized, maxLen: maxLen))
         }
-        if !current.isEmpty { chunks.append(current) }
         return chunks
     }
 
-    private static func ensurePunctuation(_ text: String) -> String {
-        guard let last = text.last else { return text }
-        if ".!?,;:".contains(last) { return text }
-        return text + ","
+    /// Split on .!?;: while keeping the terminal punctuation with the
+    /// sentence. Sentences that somehow exceed `maxLen` are split on commas
+    /// / spaces to stay within the model's L=400 phoneme bucket.
+    private static func splitSentences(_ text: String, maxLen: Int) -> [String] {
+        var out: [String] = []
+        let chars = Array(text)
+        var start = chars.startIndex
+        let enders: Set<Character> = [".", "!", "?", ";", ":"]
+
+        var i = chars.startIndex
+        while i < chars.endIndex {
+            if enders.contains(chars[i]) {
+                // Consume consecutive enders ("?!", "...", etc.) as one.
+                var j = i
+                while j < chars.endIndex && enders.contains(chars[j]) { j += 1 }
+                let piece = String(chars[start..<j]).trimmingCharacters(in: .whitespaces)
+                if !piece.isEmpty { out.append(piece) }
+                start = j
+                i = j
+            } else {
+                i += 1
+            }
+        }
+        let tail = String(chars[start..<chars.endIndex]).trimmingCharacters(in: .whitespaces)
+        if !tail.isEmpty {
+            // Give trailing fragments a soft terminator so prosody resolves.
+            out.append(tail.last.map { ".!?,;:".contains($0) } == true ? tail : tail + ",")
+        }
+
+        // Keep oversized sentences under maxLen via a last-resort comma split.
+        return out.flatMap { splitIfTooLong($0, maxLen: maxLen) }
+    }
+
+    private static func splitIfTooLong(_ s: String, maxLen: Int) -> [String] {
+        if s.count <= maxLen { return [s] }
+        var result: [String] = []
+        var current = ""
+        for part in s.components(separatedBy: ", ") {
+            if current.isEmpty { current = part; continue }
+            if current.count + 2 + part.count <= maxLen {
+                current += ", " + part
+            } else {
+                result.append(current + ",")
+                current = part
+            }
+        }
+        if !current.isEmpty { result.append(current) }
+        return result
     }
 }
 

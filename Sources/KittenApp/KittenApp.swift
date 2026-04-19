@@ -49,6 +49,16 @@ class AudioPlayer: NSObject {
         self.mixer = engine.mainMixerNode
         self.format = AVAudioFormat(standardFormatWithSampleRate: 24000, channels: 1)!
         super.init()
+        #if !os(macOS)
+        // iOS / iPadOS / visionOS / watchOS: an unconfigured AVAudioSession
+        // can default to a category that gets muted by the silent switch
+        // (.soloAmbient) or routed nowhere. Force .playback so speech
+        // output is audible regardless of ring/silent state.
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .spokenAudio,
+                                 options: [.duckOthers])
+        try? session.setActive(true, options: [])
+        #endif
         engine.attach(player)
         engine.connect(player, to: mixer, format: format)
         try? engine.start()
@@ -111,8 +121,93 @@ final class MetricsLog: ObservableObject {
 
 // MARK: - Main View
 
+// MARK: - Preset prompts
+//
+// Bank of sample prompts for quick testing — short demos plus story
+// passages from misc/ (dialogues with mixed sentence lengths stress the
+// chunker; long paragraphs stress bucketing). Story bodies are bundled
+// as .txt files under Resources/prompts/ and loaded on first access.
+struct SamplePrompt: Identifiable, Hashable {
+    let id: String
+    let label: String
+    let text: String
+}
+
+enum SamplePrompts {
+    // (filename-stem, menu label) for stories bundled under Resources/prompts/.
+    private static let storyCatalog: [(String, String)] = [
+        ("07_baba_yaga",              "Baba Yaga"),
+        ("08_shambambukli_creation",  "Shambambukli: Creation"),
+        ("09_shambambukli_humans",    "Shambambukli: Humans"),
+        ("10_ai_hype",                "AI Hype Unit"),
+        ("11_orc_culture",            "High Culture Day"),
+        ("12_dark_lord",              "The Dark Lord"),
+        ("13_hamish_dougal",          "Hamish and Dougal"),
+        ("14_in_the_shire",           "In the Shire"),
+        ("15_dragon_contract",        "Dragon Contract"),
+        ("16_goblin_park",            "Goblin Park"),
+        ("17_leprechaun",             "The Leprechaun"),
+        ("18_magic_science",          "Magic is Science"),
+        ("19_galactic_exam",          "Galactic Exam"),
+    ]
+
+    private static let builtIns: [SamplePrompt] = [
+        .init(id: "streaming",
+              label: "Streaming demo",
+              text: "Kitten TTS is now streaming audio chunks for lower latency."),
+        .init(id: "pangram",
+              label: "Pangram trio",
+              text: """
+              The quick brown fox jumps over the lazy dog.
+
+              She sells seashells by the seashore.
+
+              How much wood would a woodchuck chuck if a woodchuck could chuck wood?
+              """),
+        .init(id: "paragraph",
+              label: "Long paragraph",
+              text: """
+              Speech is one of the most fundamental ways humans communicate with each other, \
+              conveying not only the literal meaning of words but also emotion, intent, urgency, \
+              humor, and personality through prosody, pitch, and timing. A good text to speech \
+              system must capture all of these subtle cues in addition to getting the words \
+              themselves right, which is why researchers have spent decades developing better \
+              acoustic models, better voice embeddings, and better neural architectures to \
+              faithfully reproduce the nuance of the human voice.
+              """),
+        .init(id: "numbers",
+              label: "Numbers & dates",
+              text: "In 1969, Apollo 11 landed on the moon. "
+                  + "The mission cost about 25.4 billion dollars "
+                  + "and brought back 21.5 kilograms of lunar rock."),
+    ]
+
+    static let all: [SamplePrompt] = {
+        var out = builtIns
+        for (stem, label) in storyCatalog {
+            guard let url = resourceURL(stem: stem) else { continue }
+            guard let body = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            out.append(.init(id: stem, label: label,
+                             text: body.trimmingCharacters(in: .whitespacesAndNewlines)))
+        }
+        return out
+    }()
+
+    /// Xcode's filesystem-synchronized groups may put prompts/*.txt at the
+    /// bundle root or keep them under a `prompts/` subpath. Try both.
+    private static func resourceURL(stem: String) -> URL? {
+        if let u = Bundle.main.url(forResource: stem, withExtension: "txt") { return u }
+        if let base = Bundle.main.resourceURL {
+            let u = base.appendingPathComponent("prompts/\(stem).txt")
+            if FileManager.default.fileExists(atPath: u.path) { return u }
+        }
+        return nil
+    }
+}
+
 struct KittenTTSView: View {
-    @State private var text: String = "Kitten TTS is now streaming audio chunks for lower latency."
+    @State private var text: String = SamplePrompts.all[0].text
+    @AppStorage("prompt") private var promptID: String = SamplePrompts.all[0].id
     @State private var isGenerating: Bool = false
     @State private var status: String = "Loading model..."
     @State private var modelReady: Bool = false
@@ -122,6 +217,7 @@ struct KittenTTSView: View {
     @AppStorage("variant") private var variantRaw: String = KittenTTSCoreML.Variant.int8w.rawValue
     @AppStorage("compute") private var computeRaw: String = KittenTTSCoreML.Compute.all.rawValue
     @State private var speed: Float = 1.0
+    @State private var speakTask: Task<Void, Never>? = nil
     @StateObject private var log = MetricsLog()
 
     private var variant: KittenTTSCoreML.Variant {
@@ -140,15 +236,28 @@ struct KittenTTSView: View {
     private var voiceOptions: [String] { KittenTTS.voiceDisplayOrder }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 12) {
                 Text("Kittens TTS").font(.title).bold()
 
+                HStack {
+                    Text("Prompt").font(.caption).foregroundColor(.secondary)
+                    Spacer()
+                    Picker("", selection: $promptID) {
+                        ForEach(SamplePrompts.all) { p in
+                            Text(p.label).tag(p.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                }
+
                 TextEditor(text: $text)
-                    .frame(minHeight: 90, maxHeight: 140)
+                    .font(.body)
+                    .frame(minHeight: 120, maxHeight: .infinity)
                     .padding(6)
                     .overlay(RoundedRectangle(cornerRadius: 8)
                         .stroke(Color.secondary.opacity(0.5)))
+                    .layoutPriority(1)
 
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
@@ -205,20 +314,17 @@ struct KittenTTSView: View {
                 }
 
                 HStack(spacing: 12) {
-                    Button(action: generateAndStream) {
-                        if isGenerating {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Label("Speak", systemImage: "play.fill")
-                        }
+                    // Single toggle button — fixed width so layout doesn't
+                    // jump between Speak ↔ Stop states.
+                    Button(action: { isGenerating ? stopGeneration() : generateAndStream() }) {
+                        Label(isGenerating ? "Stop" : "Speak",
+                              systemImage: isGenerating ? "stop.fill" : "play.fill")
+                            .frame(maxWidth: .infinity)
                     }
-                    .disabled(isGenerating || text.isEmpty || !modelReady)
+                    .frame(width: 120)
+                    .disabled(!modelReady || (!isGenerating && text.isEmpty))
                     .buttonStyle(.borderedProminent)
-
-                    Button(action: { player.stop() }) {
-                        Label("Stop", systemImage: "stop.fill")
-                    }
-                    .buttonStyle(.bordered)
+                    .tint(isGenerating ? .red : .accentColor)
 
                     Spacer()
 
@@ -257,7 +363,7 @@ struct KittenTTSView: View {
                             }
                             .padding(6)
                         }
-                        .frame(minHeight: 160, idealHeight: 220)
+                        .frame(minHeight: 120, maxHeight: 260)
                         .background(Color.secondary.opacity(0.08))
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                         .onChange(of: log.entries.count) { _, _ in
@@ -269,10 +375,20 @@ struct KittenTTSView: View {
                         }
                     }
                 }
-            }
-            .padding()
         }
-        .task { await preloadModel() }
+        .padding()
+        #if os(macOS)
+        .frame(minWidth: 520, minHeight: 560)
+        #endif
+        .task {
+            // @State `text` is initialized before @AppStorage reads the
+            // persisted `promptID`, so without this the view always boots
+            // showing the builtIns[0] text regardless of saved selection.
+            if let p = SamplePrompts.all.first(where: { $0.id == promptID }) {
+                text = p.text
+            }
+            await preloadModel()
+        }
         .onChange(of: backend) { _, newValue in
             Task { await switchBackend(to: newValue) }
         }
@@ -280,10 +396,17 @@ struct KittenTTSView: View {
             // Variant / compute changes invalidate the loaded MLModel set.
             coreMLTTS.unload()
             log.info("variant → \(variantRaw)  (unloaded CoreML models)")
+            backgroundWarmUp()
         }
         .onChange(of: computeRaw) { _, _ in
             coreMLTTS.unload()
             log.info("compute → \(computeRaw)  (unloaded CoreML models)")
+            backgroundWarmUp()
+        }
+        .onChange(of: promptID) { _, newID in
+            if let p = SamplePrompts.all.first(where: { $0.id == newID }) {
+                text = p.text
+            }
         }
     }
 
@@ -352,6 +475,12 @@ struct KittenTTSView: View {
         await loadBackend(backend)
         modelReady = true
         status = "Ready"
+
+        // Fire-and-forget ANE compile for the default bucket pair so the
+        // first Speak doesn't pay that cost in the foreground. The CoreML
+        // disk cache persists the compiled .mlmodelc between launches, so
+        // this is only slow on first run per (variant × compute × device).
+        backgroundWarmUp()
     }
 
     /// Swap the active backend: drop the old one's memory, preload the new one.
@@ -362,6 +491,7 @@ struct KittenTTSView: View {
         await loadBackend(newBackend)
         modelReady = true
         status = "Ready"
+        backgroundWarmUp()
     }
 
     private func loadBackend(_ b: Backend) async {
@@ -396,6 +526,24 @@ struct KittenTTSView: View {
                           ramBefore, ramAfter))
     }
 
+    private func stopGeneration() {
+        speakTask?.cancel()
+        speakTask = nil
+        player.stop()
+        isGenerating = false
+        status = "Stopped"
+    }
+
+    /// Kick an off-thread ANE compile for the default bucket pair using
+    /// the current variant/compute. Safe to call repeatedly — duplicate
+    /// calls for the same (variant, compute, bucket) hit the cache.
+    private func backgroundWarmUp() {
+        guard backend == .coreml else { return }
+        Task.detached(priority: .utility) { [coreMLTTS, variant, compute] in
+            await coreMLTTS.warmUpDefault(variant: variant, compute: compute)
+        }
+    }
+
     private func generateAndStream() {
         isGenerating = true
         let tag = "\(voice) / \(backend.rawValue)"
@@ -405,13 +553,26 @@ struct KittenTTSView: View {
         let startTime = Date()
         var firstByteTime: Date?
         let captured = backend
-        Task {
+        // `.utility` keeps inference below the audio I/O thread's
+        // priority — since we already generate at RTF > 1×, leaving
+        // headroom for AVAudioEngine prevents scrolling / compute from
+        // starving audio output on smaller devices (iPhone SE has only
+        // 2 performance cores).
+        speakTask = Task(priority: .utility) {
             do {
                 let cb: (UnsafePointer<Int16>, Int) -> Void = { pointer, count in
+                    // If user pressed Stop, abandon further chunks so the
+                    // player doesn't get re-scheduled after .stop().
+                    if Task.isCancelled { return }
                     if firstByteTime == nil { firstByteTime = Date() }
                     let samples = Array(UnsafeBufferPointer(start: pointer, count: count))
+                    // Schedule on the audio thread directly —
+                    // AVAudioPlayerNode.scheduleBuffer is thread-safe, and
+                    // bouncing every chunk through the main queue stalls
+                    // audio during UI scrolling on slower devices.
+                    self.player.playChunk(samples: samples)
                     DispatchQueue.main.async {
-                        self.player.playChunk(samples: samples)
+                        if Task.isCancelled { return }
                         self.status = "Streaming [\(tag)]..."
                     }
                 }
@@ -430,12 +591,14 @@ struct KittenTTSView: View {
                         callback: cb)
                     totalSamples = s.count
                 }
+                if Task.isCancelled { return }
                 let totalMs = Date().timeIntervalSince(startTime) * 1000
                 let ttfMs = (firstByteTime ?? Date()).timeIntervalSince(startTime) * 1000
                 let audioS = Double(totalSamples) / 24000.0
                 let rtf = audioS / (totalMs / 1000.0)
                 await MainActor.run {
                     self.isGenerating = false
+                    self.speakTask = nil
                     self.status = String(format: "Done [%@] in %.2fs", tag, totalMs / 1000)
                     let backendTag = (captured == .mlx ? "MLX" : "CoreML").paddedRight(6)
                     self.log.metric(String(format:
@@ -445,6 +608,7 @@ struct KittenTTSView: View {
             } catch {
                 await MainActor.run {
                     self.isGenerating = false
+                    self.speakTask = nil
                     self.status = "Error [\(tag)]: \(error.localizedDescription)"
                     self.log.warn("speak failed: \(error.localizedDescription)")
                 }

@@ -86,6 +86,18 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
         if voiceEmbeds.isEmpty { try loadVoices() }
     }
 
+    /// Warm up the default bucket pair (text L_128 + generator N_256) for
+    /// the given variant/compute, paying the per-device ANE compile cost
+    /// off the speak path. Safe to call off the main actor; emits a
+    /// `onBucketLoaded` metric per bucket the same way a real speak does.
+    public func warmUpDefault(variant: Variant, compute: Compute) async {
+        try? await preload()
+        _ = try? await model(stage: "text",      variant: variant,
+                             compute: compute, bucket: 128)
+        _ = try? await model(stage: "generator", variant: variant,
+                             compute: compute, bucket: 256)
+    }
+
     /// Drop all loaded MLModel instances and anything they compiled.
     public func unload() {
         loadLock.withLock { models.removeAll() }
@@ -111,7 +123,11 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
         let chunks = TextChunker.chunk(normalised)
         var allAudio: [Float] = []
 
-        for chunk in chunks {
+        // ~120 ms silence between sentences so the listener's ear gets a
+        // natural comma-like break between independent chunks.
+        let gap = [Float](repeating: 0, count: Int(0.12 * 24000))
+
+        for (idx, chunk) in chunks.enumerated() {
             let phonemes = try Phonemizer.phonemize(chunk)
             let refId = min(chunk.count, 399)
             let style = Array(voiceRows[(refId * 256)..<((refId + 1) * 256)])
@@ -119,13 +135,14 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
             let audio = try await speakOneChunk(
                 phonemes: phonemes, style: style, speed: effectiveSpeed,
                 variant: variant, compute: compute)
+            let emit: [Float] = idx == 0 ? audio : gap + audio
             if let cb = callback {
-                let int16 = audio.map { Int16(clamping: Int(($0 * 32767.0).rounded())) }
+                let int16 = emit.map { Int16(clamping: Int(($0 * 32767.0).rounded())) }
                 int16.withUnsafeBufferPointer { buf in
                     if let base = buf.baseAddress { cb(base, buf.count) }
                 }
             }
-            allAudio.append(contentsOf: audio)
+            allAudio.append(contentsOf: emit)
         }
         return allAudio
     }
