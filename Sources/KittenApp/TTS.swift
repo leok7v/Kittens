@@ -396,7 +396,15 @@ struct TextChunker {
     /// a time, and the natural sentence-final intonation of each short line
     /// is preserved. Paragraph breaks (blank lines) are collapsed — the
     /// caller inserts the pause between paragraphs itself.
-    static func chunk(_ text: String, maxLen: Int = 400) -> [String] {
+    ///
+    /// `maxLen` is a *character* ceiling. Upstream CoreML buckets top out
+    /// at L=400 phonemes and N=1024 audio frames (~12.8 s of speech). A
+    /// 200-char chunk phonemizes to ~200–280 phonemes and ~600–850 audio
+    /// frames — safely under both. Going higher risks two audible bugs:
+    /// (a) phonemes past L=400 silently get truncated; (b) audio past
+    /// N=1024 frames triggers the overflow-trim in speakOneChunk, which
+    /// squeezes trailing-phoneme durations and makes the tail race.
+    static func chunk(_ text: String, maxLen: Int = 200) -> [String] {
         var chunks: [String] = []
         for paragraph in text.components(separatedBy: "\n\n") {
             let para = paragraph.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1249,21 +1257,36 @@ private func computeNoiseContribs(f0Proj: MLXArray, nFrames: Int, acousticStyle:
     let voiced = (f0Audio .> 0).asType(.float32)   // (1, 1, T_audio)
 
 
-    // Harmonic frequencies: f0 * [1,2,...,9] → (1, 9, T_audio) via broadcast
+    // Harmonic frequencies: f0 * [1,2,...,9] — (1, 9, T_frames)
     let harmonics = MLXArray([Float(1),2,3,4,5,6,7,8,9]).reshaped([1, 9, 1])
-    let f0Harm = f0Audio * harmonics
+    let f0PerFrame = f0Proj.reshaped([1, 1, T_frames]) * harmonics   // (1, 9, T_frames)
 
-    // Phase accumulation: cumsum(f0*k / sr) then scale to radians
-    let phaseInc = f0Harm / sampleRate
-    let phase = phaseInc.cumsum(axis: -1) * Float(2.0 * .pi)
+    // Per-frame phase accumulation + within-frame linear extrapolation.
+    // The original formulation cumsum'd phase_inc at audio rate over ~144 k
+    // samples, which accumulates fp32 rounding error enough to phase-shift
+    // voice harmonics and manifest as spurious tones in the CoreML export.
+    // Reducing the long-axis cumsum to one-per-frame (T_frames ≈ 480 for
+    // a 6 s utterance) eliminates that drift in both backends.
+    let step = f0PerFrame * Float(Double(hopSize) / Double(sampleRate))     // (1, 9, T_frames)
+    let phaseStart = (step.cumsum(axis: -1) - step) * Float(2.0 * .pi)      // (1, 9, T_frames)
+    let tInFrame = MLXArray(stride(from: Float(0), to: Float(hopSize), by: 1).map { $0 })
+        .reshaped([1, 1, 1, hopSize])
+    let phaseWithin = f0PerFrame.expandedDimensions(axis: -1) * tInFrame
+        / sampleRate * Float(2.0 * .pi)
+    let phase = (phaseStart.expandedDimensions(axis: -1) + phaseWithin)
+        .reshaped([1, 9, T_audio])
 
-    // Random initial phase offset per harmonic (matches ONNX RandomUniformLike)
-    let twoPi = Float(2.0 * .pi)
-    let phaseJitter = MLXRandom.uniform(Float(0)..<twoPi, [1, 9, 1])
+    // Upstream KittenTTS randomizes phase_jitter per harmonic and adds a
+    // tiny unvoiced gaussian dither (noise_std = 0.003). Both are drawn
+    // from an RNG that differs between backends (MLX, CoreML, torch),
+    // producing audibly different output each run and diverging from the
+    // reference. Since both terms are perceptually negligible in speech,
+    // zeroing them yields deterministic output and lets this backend
+    // match the CoreML backend bit-for-bit on the deterministic path.
+    _ = noiseStd
+    let phaseJitter = MLXArray.zeros([1, 9, 1], type: Float.self)
     let sines = MLX.sin(phase + phaseJitter) * sineAmp   // (1, 9, T_audio)
-
-    // Noise for unvoiced regions
-    let uvNoise = MLXRandom.normal([1, 9, T_audio], scale: noiseStd)
+    let uvNoise = MLXArray.zeros([1, 9, T_audio], type: Float.self)
 
     // Blend: sine where voiced, noise where unvoiced
     let sinGen = sines * voiced + uvNoise * (1.0 - voiced)  // (1, 9, T_audio)

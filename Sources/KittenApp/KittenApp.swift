@@ -39,11 +39,17 @@ struct KittenApp: App {
 
 // MARK: - Audio Player
 
-class AudioPlayer: NSObject {
+final class AudioPlayer: NSObject, @unchecked Sendable {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private let mixer: AVAudioMixerNode
     private let format: AVAudioFormat
+    // Monotonic generation counter: every call to stop() bumps it, and any
+    // stale chunks from an in-flight inference that arrive AFTER stop() will
+    // see a mismatched id and be dropped. Prevents audible "stop → silence
+    // → resume as another chunk lands" behaviour.
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
 
     override init() {
         self.mixer = engine.mainMixerNode
@@ -64,7 +70,21 @@ class AudioPlayer: NSObject {
         try? engine.start()
     }
 
-    func playChunk(samples: [Int16], sampleRate: Double = 24000) {
+    /// Returns the id of the new generation — pass back to `playChunk` so
+    /// chunks scheduled before the next `stop()` still play and chunks
+    /// scheduled after are dropped.
+    func beginGeneration() -> UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        generation &+= 1
+        return generation
+    }
+
+    func playChunk(samples: [Int16], generation gen: UInt64,
+                   sampleRate: Double = 24000) {
+        lock.lock()
+        let current = generation
+        lock.unlock()
+        if gen != current { return }
         let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count))!
         buffer.frameLength = buffer.frameCapacity
         for i in 0..<samples.count {
@@ -74,7 +94,10 @@ class AudioPlayer: NSObject {
         if !player.isPlaying { player.play() }
     }
 
-    func stop() { player.stop() }
+    func stop() {
+        lock.lock(); generation &+= 1; lock.unlock()
+        player.stop()
+    }
 }
 
 // MARK: - Small helpers
@@ -206,8 +229,15 @@ enum SamplePrompts {
 }
 
 struct KittenTTSView: View {
-    @State private var text: String = SamplePrompts.all[0].text
-    @AppStorage("prompt") private var promptID: String = SamplePrompts.all[0].id
+    // Default prompt on first launch — the Long Paragraph exercises the
+    // chunker and stresses all L / N buckets so the user hears the full
+    // quality envelope without having to pick anything.
+    private static let defaultPromptID = "paragraph"
+    @State private var text: String = {
+        SamplePrompts.all.first(where: { $0.id == defaultPromptID })?.text
+            ?? SamplePrompts.all[0].text
+    }()
+    @AppStorage("prompt") private var promptID: String = defaultPromptID
     @State private var isGenerating: Bool = false
     @State private var status: String = "Loading model..."
     @State private var modelReady: Bool = false
@@ -390,20 +420,27 @@ struct KittenTTSView: View {
             await preloadModel()
         }
         .onChange(of: backend) { _, newValue in
+            stopGeneration()
             Task { await switchBackend(to: newValue) }
         }
         .onChange(of: variantRaw) { _, _ in
             // Variant / compute changes invalidate the loaded MLModel set.
+            stopGeneration()
             coreMLTTS.unload()
             log.info("variant → \(variantRaw)  (unloaded CoreML models)")
-            backgroundWarmUp()
+            gatedWarmUp()
         }
         .onChange(of: computeRaw) { _, _ in
+            stopGeneration()
             coreMLTTS.unload()
             log.info("compute → \(computeRaw)  (unloaded CoreML models)")
-            backgroundWarmUp()
+            gatedWarmUp()
+        }
+        .onChange(of: voice) { _, _ in
+            stopGeneration()
         }
         .onChange(of: promptID) { _, newID in
+            stopGeneration()
             if let p = SamplePrompts.all.first(where: { $0.id == newID }) {
                 text = p.text
             }
@@ -473,14 +510,18 @@ struct KittenTTSView: View {
 
         // Only the currently-selected backend is resident at any time.
         await loadBackend(backend)
+        // ANE compile for the default bucket pair happens here, before
+        // `modelReady = true`, so the Speak button stays disabled until
+        // the first utterance can start without paying the cold-compile
+        // tax. Per-device ANE compile is cached on disk between launches
+        // (NSCachesDirectory/KittenTTS/...), so this is only slow on the
+        // first run per (variant × compute × device).
+        if backend == .coreml {
+            status = "Warming up..."
+            await coreMLTTS.warmUpAll(variant: variant, compute: compute)
+        }
         modelReady = true
         status = "Ready"
-
-        // Fire-and-forget ANE compile for the default bucket pair so the
-        // first Speak doesn't pay that cost in the foreground. The CoreML
-        // disk cache persists the compiled .mlmodelc between launches, so
-        // this is only slow on first run per (variant × compute × device).
-        backgroundWarmUp()
     }
 
     /// Swap the active backend: drop the old one's memory, preload the new one.
@@ -489,9 +530,12 @@ struct KittenTTSView: View {
         status = "Switching to \(newBackend.rawValue)..."
         await unloadBackend(newBackend == .mlx ? .coreml : .mlx)
         await loadBackend(newBackend)
+        if newBackend == .coreml {
+            status = "Warming up..."
+            await coreMLTTS.warmUpAll(variant: variant, compute: compute)
+        }
         modelReady = true
         status = "Ready"
-        backgroundWarmUp()
     }
 
     private func loadBackend(_ b: Backend) async {
@@ -534,13 +578,19 @@ struct KittenTTSView: View {
         status = "Stopped"
     }
 
-    /// Kick an off-thread ANE compile for the default bucket pair using
-    /// the current variant/compute. Safe to call repeatedly — duplicate
-    /// calls for the same (variant, compute, bucket) hit the cache.
-    private func backgroundWarmUp() {
+    /// Block until ANE compile for the default bucket pair completes for
+    /// the current variant/compute. Flips `modelReady` around the call so
+    /// the Speak button is disabled while warmup runs.
+    private func gatedWarmUp() {
         guard backend == .coreml else { return }
-        Task.detached(priority: .utility) { [coreMLTTS, variant, compute] in
-            await coreMLTTS.warmUpDefault(variant: variant, compute: compute)
+        modelReady = false
+        status = "Warming up..."
+        Task(priority: .userInitiated) { [coreMLTTS, variant, compute] in
+            await coreMLTTS.warmUpAll(variant: variant, compute: compute)
+            await MainActor.run {
+                modelReady = true
+                status = "Ready"
+            }
         }
     }
 
@@ -549,6 +599,10 @@ struct KittenTTSView: View {
         let tag = "\(voice) / \(backend.rawValue)"
         status = "Speaking [\(tag)]..."
         player.stop()
+        // Every Speak gets a fresh generation id. Chunks scheduled AFTER a
+        // subsequent stop() (either by the user or by another Speak) will
+        // see a mismatched id and be dropped by the player.
+        let gen = player.beginGeneration()
 
         let startTime = Date()
         var firstByteTime: Date?
@@ -561,8 +615,6 @@ struct KittenTTSView: View {
         speakTask = Task(priority: .utility) {
             do {
                 let cb: (UnsafePointer<Int16>, Int) -> Void = { pointer, count in
-                    // If user pressed Stop, abandon further chunks so the
-                    // player doesn't get re-scheduled after .stop().
                     if Task.isCancelled { return }
                     if firstByteTime == nil { firstByteTime = Date() }
                     let samples = Array(UnsafeBufferPointer(start: pointer, count: count))
@@ -570,7 +622,7 @@ struct KittenTTSView: View {
                     // AVAudioPlayerNode.scheduleBuffer is thread-safe, and
                     // bouncing every chunk through the main queue stalls
                     // audio during UI scrolling on slower devices.
-                    self.player.playChunk(samples: samples)
+                    self.player.playChunk(samples: samples, generation: gen)
                     DispatchQueue.main.async {
                         if Task.isCancelled { return }
                         self.status = "Streaming [\(tag)]..."

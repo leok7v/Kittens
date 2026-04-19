@@ -86,16 +86,22 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
         if voiceEmbeds.isEmpty { try loadVoices() }
     }
 
-    /// Warm up the default bucket pair (text L_128 + generator N_256) for
-    /// the given variant/compute, paying the per-device ANE compile cost
-    /// off the speak path. Safe to call off the main actor; emits a
-    /// `onBucketLoaded` metric per bucket the same way a real speak does.
-    public func warmUpDefault(variant: Variant, compute: Compute) async {
+    /// Warm up every text-L and generator-N bucket for the given
+    /// variant/compute, paying the per-device ANE compile cost once per
+    /// install rather than on the first utterance whose length hits an
+    /// un-warmed bucket. Emits an `onBucketLoaded` metric per bucket so
+    /// the UI can show progress. Safe to call repeatedly — already-
+    /// loaded (variant, compute, bucket) keys hit the model cache.
+    public func warmUpAll(variant: Variant, compute: Compute) async {
         try? await preload()
-        _ = try? await model(stage: "text",      variant: variant,
-                             compute: compute, bucket: 128)
-        _ = try? await model(stage: "generator", variant: variant,
-                             compute: compute, bucket: 256)
+        for L in Self.textBuckets {
+            _ = try? await model(stage: "text", variant: variant,
+                                 compute: compute, bucket: L)
+        }
+        for N in Self.generatorBuckets {
+            _ = try? await model(stage: "generator", variant: variant,
+                                 compute: compute, bucket: N)
+        }
     }
 
     /// Drop all loaded MLModel instances and anything they compiled.

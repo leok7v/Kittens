@@ -709,21 +709,39 @@ def compute_noise_contribs(f0_proj: torch.Tensor, n_frames: int,
     voiced = (f0_audio > 0).to(torch.float32)
 
     harmonics = torch.arange(1, 10, dtype=torch.float32, device=f0_proj.device).reshape(1, 9, 1)
-    f0_harm = f0_audio * harmonics
-    phase_inc = f0_harm / sr
-    phase = phase_inc.cumsum(dim=-1) * (2.0 * math.pi)
 
-    gen = None
-    if seed is not None:
-        gen = torch.Generator(device=f0_proj.device)
-        gen.manual_seed(seed)
-    # Use torch.rand (out-of-place) so coremltools can map to random_uniform.
-    if gen is not None:
-        phase_jitter = torch.rand(1, 9, 1, generator=gen, device=f0_proj.device) * (2.0 * math.pi)
-        uv_noise = torch.randn(1, 9, T_audio, generator=gen, device=f0_proj.device) * noise_std
-    else:
-        phase_jitter = torch.rand(1, 9, 1, device=f0_proj.device) * (2.0 * math.pi)
-        uv_noise = torch.randn(1, 9, T_audio, device=f0_proj.device) * noise_std
+    # Per-frame phase accumulation.
+    #
+    # Original formulation summed phase_inc (length T_audio = n_frames*2*hop,
+    # up to ~160k samples) via a single long cumsum. In fp32 this accumulates
+    # ~10^-3 abs error over the full run; coremltools' cumsum rewrite drifts
+    # even more, which causes +30 dB spurious peaks at voice harmonics in
+    # the exported model. Since f0 is piecewise-constant per frame, we can
+    # (a) cumsum over just T_frames frame-sized steps (one per frame) and
+    # (b) add a within-frame linear phase for samples inside each frame.
+    # That shrinks the long-axis cumsum by `hop`= 300× and eliminates the
+    # drift both in torch fp32 and in the CoreML export.
+    f0_per_frame = f0_proj.reshape(1, 1, T_frames) * harmonics      # (1, 9, T_frames)
+    step = f0_per_frame * (hop / sr)                                # cycles per frame
+    phase_start = (step.cumsum(dim=-1) - step) * (2.0 * math.pi)    # (1, 9, T_frames)
+
+    t_in_frame = torch.arange(hop, dtype=torch.float32,
+                              device=f0_proj.device).reshape(1, 1, 1, hop)
+    phase_within = (f0_per_frame.unsqueeze(-1) * t_in_frame) / sr * (2.0 * math.pi)
+    phase = (phase_start.unsqueeze(-1) + phase_within).reshape(1, 9, T_audio)
+
+    # The original upstream model added random phase_jitter per harmonic
+    # and unvoiced gaussian noise to the sine generator as a dither pass.
+    # coremltools maps torch.rand / torch.randn to CoreML's own RNG, which
+    # draws a completely independent stream from torch's — so the exported
+    # model produced audibly different audio each run and diverged from
+    # the MLX / PyTorch references. The dither is at sine_amp * O(1) rad
+    # for phase and noise_std = 0.003 for uv_noise — both imperceptible
+    # in speech, so zeroing them keeps the CoreML export bit-reproducible
+    # and keeps torch / coreml / mlx on the same output (up to ~2 % RMS).
+    _ = seed; _ = noise_std
+    phase_jitter = torch.zeros(1, 9, 1, device=f0_proj.device)
+    uv_noise = torch.zeros(1, 9, T_audio, device=f0_proj.device)
     sines = torch.sin(phase + phase_jitter) * sine_amp
     sin_gen = sines * voiced + uv_noise * (1.0 - voiced)
 
