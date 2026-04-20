@@ -1,9 +1,68 @@
 # KittenTTS CoreML — Investigation and Plan
 
 Status file meant to survive context compaction. If a fresh AI session picks
-up work here, read this document end-to-end before touching code. Last updated
-mid-investigation; current state of the repo reflects the "before" column of
-every table below unless a commit says otherwise.
+up work here, read this document end-to-end before touching code.
+
+---
+
+## 0. Current state snapshot (2026-04-19)
+
+Both MLX and CoreML backends are shipping and sound clean on short and long
+text. The original 720 Hz CoreML tonal artifact is gone. Key changes since
+the historical sections below were written — do NOT relitigate these:
+
+- **Zero dither**: `phase_jitter` / `uv_noise` in the noise path are
+  forced to zero in BOTH `scripts/torch_kitten.py`
+  (`compute_noise_contribs`) AND `Sources/KittenApp/TTS.swift`
+  (`computeNoiseContribs`). Reason: torch and CoreML (and MLX) draw from
+  independent RNGs; keeping those terms makes output diverge per run
+  and per backend. noise_std was 0.003 and phase_jitter was per-harmonic
+  — both imperceptible in speech. Zeroing them makes output bit-reproducible.
+- **Per-frame phase cumsum**: the long cumsum over ~144k samples accumulates
+  fp32 drift audibly; replaced by a short (≈480-element) per-frame cumsum
+  plus within-frame linear extrapolation. Applied to both
+  `compute_noise_contribs` (torch) and `computeNoiseContribs` (MLX).
+  Isolated probe: without fix, torch-vs-CoreML cos = 0.44; with fix,
+  cos = 0.999985. Pipeline-level cos went 0.47 → 0.98.
+- **End-click fix**: `tailDropFrames = 3` in `TTS.CoreML.swift
+  speakOneChunk`. Decoder non-causal convolutions bleed zero-padding
+  artifacts into the last ~3 real frames; dropping those frames before
+  fade-out kills the click. Fades are 3 ms in / 40 ms out.
+- **Chunker maxLen = 200 chars** in `TextChunker.chunk` in TTS.swift.
+  Single sentences longer than 200 chars are split on `", "`. Keeps
+  chunks under L=400 phoneme truncation and N=1024 audio-frame
+  overflow-trim (which compressed trailing-phoneme durations and made
+  long sentences "speed up at the end" — that bug is now unreachable).
+- **Inter-sentence silence**: 120 ms of zeros between streamed chunks
+  in both `TTS.swift` and `TTS.CoreML.swift`. Natural comma-like pause.
+- **CoreML export**: after re-quantization with real calibration and
+  the numerical fixes above, we ship `fp32`, `fp16`, `int8w`. `int8wa`
+  is parked — see §12 of this document. Winner config is
+  `coreml/int8w/all` (ANE): warm RTF ~25×, ~50 MB RAM.
+- **UI**: Speak/Stop single toggle button (no layout shift), Stop
+  cancels inference AND drops any late chunks via an AudioPlayer
+  generation counter, Prompt picker with 16 presets (4 built-in + 13
+  stories from `misc/`), persistent @AppStorage for voice/backend/
+  variant/compute/prompt, default prompt on fresh install is the
+  "Long paragraph" stress test. Voice list ordered Hugo, Luna, Kiki,
+  Leo, Bella, Jasper, Bruno, Rosie (subjective cleanness).
+- **iOS fixes**: AVAudioSession set to `.playback` + `.spokenAudio` +
+  `.duckOthers` so audio survives the silent-switch; `minWidth 520`
+  floor is `#if os(macOS)` only; stale `mlx.metallib` codesign issue
+  cured by gating `installMetalLib()` to non-.app bundles.
+- **ANE warmup**: `coreMLTTS.warmUpAll(variant:compute:)` walks every
+  L and N bucket; loaded during `loadBackend` so `modelReady = true`
+  only flips after compile is done. Variant/compute/backend switches
+  re-gate with a "Warming up…" status.
+
+### Next direction (pending decision)
+
+`LLAMA.BACKEND.md` at repo root is the plan for a **separate** new repo
+that ports KittenTTS to llama.cpp/ggml for portable Linux/Android
+targets. Not started. Current Kittens repo saves ~40% of that work
+(reference numerics in `scripts/torch_kitten.py`, CEPhonemizer C++,
+test corpus, all the hard-won numerical fixes listed above). Read
+`LLAMA.BACKEND.md` before doing anything on the ggml side.
 
 ---
 
