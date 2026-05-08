@@ -113,6 +113,9 @@ private extension String {
 enum Backend: String, CaseIterable, Identifiable {
     case mlx = "MLX"
     case coreml = "CoreML"
+#if os(macOS)
+    case ggml = "GGML"
+#endif
     var id: String { rawValue }
 }
 
@@ -261,6 +264,9 @@ struct KittenTTSView: View {
 
     private let mlxTTS = KittenTTS()
     private let coreMLTTS = KittenTTSCoreML()
+#if os(macOS)
+    private let ggmlTTS = KittenTTSLlamaCpp()
+#endif
     private let player = AudioPlayer()
 
     private var voiceOptions: [String] { KittenTTS.voiceDisplayOrder }
@@ -319,7 +325,7 @@ struct KittenTTSView: View {
                         }
                         .pickerStyle(.segmented)
                         .frame(maxWidth: 240)
-                        .disabled(isGenerating || backend == .mlx)
+                        .disabled(isGenerating || backend != .coreml)
                     }
                     HStack {
                         Text("Compute").font(.caption).foregroundColor(.secondary)
@@ -331,7 +337,7 @@ struct KittenTTSView: View {
                         }
                         .pickerStyle(.segmented)
                         .frame(maxWidth: 160)
-                        .disabled(isGenerating || backend == .mlx)
+                        .disabled(isGenerating || backend != .coreml)
                     }
                     HStack {
                         Text("Speed").font(.caption).foregroundColor(.secondary)
@@ -507,6 +513,17 @@ struct KittenTTSView: View {
                     m.phonemes, m.elapsedMs, audioS, rtf))
             }
         }
+#if os(macOS)
+        ggmlTTS.onChunkMetrics = { [weak log] m in
+            let audioS = Double(m.samples) / 24000.0
+            let rtf = audioS / (m.totalMs / 1000.0)
+            Task { @MainActor in
+                log?.metric(String(format:
+                    "GGML   chunk   phonemes=%d frames=%d         total %.0fms  audio %.2fs  RTF %.1fx",
+                    m.phonemes, m.frames, m.totalMs, audioS, rtf))
+            }
+        }
+#endif
 
         // Only the currently-selected backend is resident at any time.
         await loadBackend(backend)
@@ -528,7 +545,10 @@ struct KittenTTSView: View {
     private func switchBackend(to newBackend: Backend) async {
         modelReady = false
         status = "Switching to \(newBackend.rawValue)..."
-        await unloadBackend(newBackend == .mlx ? .coreml : .mlx)
+        // Unload every other backend so only the active one stays resident.
+        for b in Backend.allCases where b != newBackend {
+            await unloadBackend(b)
+        }
         await loadBackend(newBackend)
         if newBackend == .coreml {
             status = "Warming up..."
@@ -538,14 +558,27 @@ struct KittenTTSView: View {
         status = "Ready"
     }
 
+    private func backendTag(_ b: Backend) -> String {
+        switch b {
+        case .mlx:    return "MLX".paddedRight(6)
+        case .coreml: return "CoreML".paddedRight(6)
+#if os(macOS)
+        case .ggml:   return "GGML".paddedRight(6)
+#endif
+        }
+    }
+
     private func loadBackend(_ b: Backend) async {
-        let tag = (b == .mlx ? "MLX" : "CoreML").paddedRight(6)
+        let tag = backendTag(b)
         let ramBefore = KittenMetrics.residentMB()
         let t0 = Date()
         do {
             switch b {
             case .mlx:    try await mlxTTS.preload()
             case .coreml: try await coreMLTTS.preload()
+#if os(macOS)
+            case .ggml:   try await ggmlTTS.preload()
+#endif
             }
             let ms = Date().timeIntervalSince(t0) * 1000
             let ramAfter = KittenMetrics.residentMB()
@@ -557,11 +590,14 @@ struct KittenTTSView: View {
     }
 
     private func unloadBackend(_ b: Backend) async {
-        let tag = (b == .mlx ? "MLX" : "CoreML").paddedRight(6)
+        let tag = backendTag(b)
         let ramBefore = KittenMetrics.residentMB()
         switch b {
         case .mlx:    mlxTTS.unload()
         case .coreml: coreMLTTS.unload()
+#if os(macOS)
+        case .ggml:   ggmlTTS.unload()
+#endif
         }
         // Give autorelease pools a moment to actually drop the pages.
         try? await Task.sleep(nanoseconds: 50_000_000)
@@ -642,6 +678,13 @@ struct KittenTTSView: View {
                         variant: variant, compute: compute,
                         callback: cb)
                     totalSamples = s.count
+#if os(macOS)
+                case .ggml:
+                    let cfg = KittenTTSLlamaCpp.Config(speed: capturedSpeed, voiceID: voice)
+                    let s = try await ggmlTTS.speak(
+                        text: text, config: cfg, callback: cb)
+                    totalSamples = s.count
+#endif
                 }
                 if Task.isCancelled { return }
                 let totalMs = Date().timeIntervalSince(startTime) * 1000
@@ -652,9 +695,9 @@ struct KittenTTSView: View {
                     self.isGenerating = false
                     self.speakTask = nil
                     self.status = String(format: "Done [%@] in %.2fs", tag, totalMs / 1000)
-                    let backendTag = (captured == .mlx ? "MLX" : "CoreML").paddedRight(6)
+                    let bTag = self.backendTag(captured)
                     self.log.metric(String(format:
-                        "\(backendTag) SPEAK   TTF %.0fms total %.0fms  audio %.2fs  RTF %.1fx",
+                        "\(bTag) SPEAK   TTF %.0fms total %.0fms  audio %.2fs  RTF %.1fx",
                         ttfMs, totalMs, audioS, rtf))
                 }
             } catch {

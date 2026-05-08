@@ -280,6 +280,15 @@
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/Sources/KittenApp/CEPhonemizer",
 					"$(SRCROOT)/Sources/KittenApp/CEPhonemizer/include",
+					"$(SRCROOT)/vendors/llama.cpp/ggml/include",
+				);
+				"OTHER_LDFLAGS[sdk=macosx*]" = (
+					"$(SRCROOT)/vendors/llama.cpp/build-cpu/ggml/src/libggml.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-cpu/ggml/src/libggml-cpu.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-cpu/ggml/src/libggml-base.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-cpu/ggml/src/ggml-blas/libggml-blas.a",
+					"-framework",
+					"Accelerate",
 				);
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -339,6 +348,15 @@
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/Sources/KittenApp/CEPhonemizer",
 					"$(SRCROOT)/Sources/KittenApp/CEPhonemizer/include",
+					"$(SRCROOT)/vendors/llama.cpp/ggml/include",
+				);
+				"OTHER_LDFLAGS[sdk=macosx*]" = (
+					"$(SRCROOT)/vendors/llama.cpp/build-cpu/ggml/src/libggml.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-cpu/ggml/src/libggml-cpu.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-cpu/ggml/src/libggml-base.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-cpu/ggml/src/ggml-blas/libggml-blas.a",
+					"-framework",
+					"Accelerate",
 				);
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;

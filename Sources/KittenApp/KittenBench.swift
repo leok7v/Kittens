@@ -105,6 +105,14 @@ enum KittenBench {
                         variant: cfg.variant ?? .int8w,
                         compute: cfg.compute ?? .all,
                         callback: { _, _ in if firstByte == nil { firstByte = Date() } })
+#if os(macOS)
+                case .ggml:
+                    let ggml = KittenTTSLlamaCpp()
+                    samples = try await ggml.speak(
+                        text: text,
+                        config: KittenTTSLlamaCpp.Config(speed: 1.0, voiceID: voice),
+                        callback: { _, _ in if firstByte == nil { firstByte = Date() } })
+#endif
                 }
             } catch {
                 FileHandle.standardError.write(Data("ERROR \(cfg.label) run \(r): \(error.localizedDescription)\n".utf8))
