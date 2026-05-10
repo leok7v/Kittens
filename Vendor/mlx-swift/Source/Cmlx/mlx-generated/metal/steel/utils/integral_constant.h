@@ -7,6 +7,13 @@
 
 #pragma METAL internals : enable
 
+// SwiftPM consumers can't pass MTL_COMPILER_FLAGS to silence the
+// `if constexpr` warnings these files emit (Metal's default is pre-C++17
+// per-file). Pragma-silence here so the build is clean. clangd's view of
+// these headers is governed by the repo-root .clangd file.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wc++17-extensions"
+
 namespace mlx {
 namespace steel {
 
@@ -130,5 +137,7 @@ METAL_FUNC constexpr auto sum(T x, Us... us) {
 
 } // namespace steel
 } // namespace mlx
+
+#pragma clang diagnostic pop
 
 #pragma METAL internals : disable

@@ -1,0 +1,18 @@
+# clangd configuration — IDE-only (does not affect Xcode/SwiftPM builds).
+#
+# The mlx-generated Metal headers under Vendor/mlx-swift/.../mlx-generated/
+# are .h files written for the Metal compiler (which auto-includes the
+# `metal_stdlib` types and provides `constant` / `METAL_FUNC` keywords).
+# clangd parses them as plain C++ and emits a stream of false errors
+# (`'metal_stdlib' file not found`, `Unknown type name 'constant'`, etc.).
+# These are NOT real compile errors — the actual Xcode + SwiftPM build is
+# clean — they're purely an artifact of clangd not having the Metal SDK
+# context. Suppress them so the editor "Issues" panel stays usable.
+
+If:
+  PathMatch:
+    - Vendor/mlx-swift/Source/Cmlx/mlx-generated/.*\.h$
+    - Vendor/mlx-swift/Source/Cmlx/mlx-generated/.*\.metal$
+
+Diagnostics:
+  Suppress: "*"

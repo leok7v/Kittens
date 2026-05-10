@@ -2,6 +2,11 @@
 
 #include "../../../steel/attn/attn.h"
 
+// Silence `if constexpr` warnings in this Metal kernel TU. SwiftPM doesn't
+// expose Metal compile flags, so we localise the suppression here.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wc++17-extensions"
+
 using namespace mlx::steel;
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -469,3 +474,5 @@ template <
     Otile.template store<T, 1, 1>(O, params->O_strides[2]);
   }
 }
+
+#pragma clang diagnostic pop
