@@ -113,7 +113,7 @@ private extension String {
 enum Backend: String, CaseIterable, Identifiable {
     case mlx = "MLX"
     case coreml = "CoreML"
-#if os(macOS)
+#if os(macOS) || os(iOS)
     case ggml = "GGML"
 #endif
     var id: String { rawValue }
@@ -264,7 +264,7 @@ struct KittenTTSView: View {
 
     private let mlxTTS = KittenTTS()
     private let coreMLTTS = KittenTTSCoreML()
-#if os(macOS)
+#if os(macOS) || os(iOS)
     private let ggmlTTS = KittenTTSLlamaCpp()
 #endif
     private let player = AudioPlayer()
@@ -513,7 +513,7 @@ struct KittenTTSView: View {
                     m.phonemes, m.elapsedMs, audioS, rtf))
             }
         }
-#if os(macOS)
+#if os(macOS) || os(iOS)
         ggmlTTS.onChunkMetrics = { [weak log] m in
             let audioS = Double(m.samples) / 24000.0
             let rtf = audioS / (m.totalMs / 1000.0)
@@ -562,7 +562,7 @@ struct KittenTTSView: View {
         switch b {
         case .mlx:    return "MLX".paddedRight(6)
         case .coreml: return "CoreML".paddedRight(6)
-#if os(macOS)
+#if os(macOS) || os(iOS)
         case .ggml:   return "GGML".paddedRight(6)
 #endif
         }
@@ -576,7 +576,7 @@ struct KittenTTSView: View {
             switch b {
             case .mlx:    try await mlxTTS.preload()
             case .coreml: try await coreMLTTS.preload()
-#if os(macOS)
+#if os(macOS) || os(iOS)
             case .ggml:   try await ggmlTTS.preload()
 #endif
             }
@@ -595,7 +595,7 @@ struct KittenTTSView: View {
         switch b {
         case .mlx:    mlxTTS.unload()
         case .coreml: coreMLTTS.unload()
-#if os(macOS)
+#if os(macOS) || os(iOS)
         case .ggml:   ggmlTTS.unload()
 #endif
         }
@@ -678,7 +678,7 @@ struct KittenTTSView: View {
                         variant: variant, compute: compute,
                         callback: cb)
                     totalSamples = s.count
-#if os(macOS)
+#if os(macOS) || os(iOS)
                 case .ggml:
                     let cfg = KittenTTSLlamaCpp.Config(speed: capturedSpeed, voiceID: voice)
                     let s = try await ggmlTTS.speak(

@@ -1,4 +1,4 @@
-#if os(macOS)
+#if os(macOS) || os(iOS)
 import Foundation
 import CoreML
 
@@ -105,7 +105,7 @@ enum KittenBench {
                         variant: cfg.variant ?? .int8w,
                         compute: cfg.compute ?? .all,
                         callback: { _, _ in if firstByte == nil { firstByte = Date() } })
-#if os(macOS)
+#if os(macOS) || os(iOS)
                 case .ggml:
                     let ggml = KittenTTSLlamaCpp()
                     samples = try await ggml.speak(

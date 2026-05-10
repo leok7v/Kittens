@@ -1,7 +1,7 @@
 // v1 is macOS-only — the linked llama.cpp static libs in
 // vendors/llama.cpp/build-cpu/ are built for macOS. iOS/xrOS support would
 // require building those libs for each platform via xcframework.
-#if os(macOS)
+#if os(macOS) || os(iOS)
 
 import Foundation
 import os

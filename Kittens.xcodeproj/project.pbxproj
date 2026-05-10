@@ -290,6 +290,22 @@
 					"-framework",
 					"Accelerate",
 				);
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/Release-iphoneos/libggml.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/Release-iphoneos/libggml-cpu.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/Release-iphoneos/libggml-base.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/ggml-blas/Release-iphoneos/libggml-blas.a",
+					"-framework",
+					"Accelerate",
+				);
+				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/Release-iphonesimulator/libggml.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/Release-iphonesimulator/libggml-cpu.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/Release-iphonesimulator/libggml-base.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/ggml-blas/Release-iphonesimulator/libggml-blas.a",
+					"-framework",
+					"Accelerate",
+				);
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -355,6 +371,22 @@
 					"$(SRCROOT)/vendors/llama.cpp/build-cpu/ggml/src/libggml-cpu.a",
 					"$(SRCROOT)/vendors/llama.cpp/build-cpu/ggml/src/libggml-base.a",
 					"$(SRCROOT)/vendors/llama.cpp/build-cpu/ggml/src/ggml-blas/libggml-blas.a",
+					"-framework",
+					"Accelerate",
+				);
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/Release-iphoneos/libggml.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/Release-iphoneos/libggml-cpu.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/Release-iphoneos/libggml-base.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/ggml-blas/Release-iphoneos/libggml-blas.a",
+					"-framework",
+					"Accelerate",
+				);
+				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/Release-iphonesimulator/libggml.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/Release-iphonesimulator/libggml-cpu.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/Release-iphonesimulator/libggml-base.a",
+					"$(SRCROOT)/vendors/llama.cpp/build-ios/ggml/src/ggml-blas/Release-iphonesimulator/libggml-blas.a",
 					"-framework",
 					"Accelerate",
 				);

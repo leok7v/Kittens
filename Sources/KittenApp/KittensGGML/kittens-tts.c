@@ -1,8 +1,7 @@
-// v1 is macOS-only: vendors/llama.cpp/build-cpu/ ships static libs only for
-// macOS. iOS/xrOS targets compile this as an empty TU. (When you eventually
-// build llama.cpp as an xcframework with iOS/xrOS slices, drop the guard.)
+// Compile on macOS + iOS (device + simulator). xrOS still skips it — no
+// llama.cpp build for that platform yet.
 #include <TargetConditionals.h>
-#if TARGET_OS_OSX
+#if TARGET_OS_OSX || TARGET_OS_IOS
 
 // kittens-tts.c — single-file llama.cpp/ggml backend for KittenTTS-nano-v0.8.
 //
@@ -2519,4 +2518,4 @@ int main(int argc, char ** argv) {
 
 #endif // KT_BUILD_CLI
 
-#endif // TARGET_OS_OSX
+#endif // TARGET_OS_OSX || TARGET_OS_IOS
