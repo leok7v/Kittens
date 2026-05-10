@@ -129,9 +129,16 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
         let chunks = TextChunker.chunk(normalised)
         var allAudio: [Float] = []
 
-        // ~120 ms silence between sentences so the listener's ear gets a
-        // natural comma-like break between independent chunks.
+        // 120 ms inter-sentence silence — only between true sentence
+        // breaks (prev chunk ends in `.!?`). Sub-clause boundaries left
+        // by the maxLen overflow split (chunks ending in `,`) get no
+        // gap, otherwise a comma-broken long sentence would hear an
+        // artificial pause inside one thought.
         let gap = [Float](repeating: 0, count: Int(0.12 * 24000))
+        func gapAfter(_ prev: String) -> [Float] {
+            guard let last = prev.last else { return [] }
+            return (last == "." || last == "!" || last == "?") ? gap : []
+        }
 
         for (idx, chunk) in chunks.enumerated() {
             let phonemes = try Phonemizer.phonemize(chunk)
@@ -141,7 +148,7 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
             let audio = try await speakOneChunk(
                 phonemes: phonemes, style: style, speed: effectiveSpeed,
                 variant: variant, compute: compute)
-            let emit: [Float] = idx == 0 ? audio : gap + audio
+            let emit: [Float] = idx == 0 ? audio : gapAfter(chunks[idx - 1]) + audio
             if let cb = callback {
                 let int16 = emit.map { Int16(clamping: Int(($0 * 32767.0).rounded())) }
                 int16.withUnsafeBufferPointer { buf in

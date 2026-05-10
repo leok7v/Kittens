@@ -130,10 +130,23 @@ public final nonisolated class KittenTTS: @unchecked Sendable {
 
             let effectiveSpeed = config.speed * (KittenTTS.speedPriors[voiceID] ?? 1.0)
             let normalised = TextPreprocessor.process(text)
-            let chunks = TextChunker.chunk(normalised)
+            // MLX uses dynamic shapes — no L=400 bucket like CoreML.
+            // Pass `.max` so the chunker only breaks on `.!?` and never
+            // on commas; whole sentences stay together regardless of
+            // length. Eliminates the mid-sentence comma-split pause.
+            let chunks = TextChunker.chunk(normalised, maxLen: .max)
             var allAudio: [Float] = []
 
+            // 120 ms inter-sentence silence — only between true sentence
+            // breaks (prev chunk ends in `.!?`). Sub-clause boundaries
+            // (`,;:` left mid-sentence by the maxLen overflow split, or
+            // a soft-comma terminator) get no gap so the listener doesn't
+            // hear an unexpected pause inside one thought.
             let gap = [Float](repeating: 0, count: Int(0.12 * 24000))
+            func gapAfter(_ prev: String) -> [Float] {
+                guard let last = prev.last else { return [] }
+                return (last == "." || last == "!" || last == "?") ? gap : []
+            }
 
             for (idx, chunk) in chunks.enumerated() {
                 let phonemes = try Phonemizer.phonemize(chunk)
@@ -155,7 +168,7 @@ public final nonisolated class KittenTTS: @unchecked Sendable {
                     elapsedMs: elapsedMs,
                     samples: samples.count))
 
-                let emit: [Float] = idx == 0 ? samples : gap + samples
+                let emit: [Float] = idx == 0 ? samples : gapAfter(chunks[idx - 1]) + samples
                 if let cb = callback {
                     let int16Samples = emit.map { Int16(clamping: Int(round($0 * 32767.0))) }
                     int16Samples.withUnsafeBufferPointer { buffer in
@@ -397,14 +410,23 @@ struct TextChunker {
     /// is preserved. Paragraph breaks (blank lines) are collapsed — the
     /// caller inserts the pause between paragraphs itself.
     ///
-    /// `maxLen` is a *character* ceiling. Upstream CoreML buckets top out
-    /// at L=400 phonemes and N=1024 audio frames (~12.8 s of speech). A
-    /// 200-char chunk phonemizes to ~200–280 phonemes and ~600–850 audio
-    /// frames — safely under both. Going higher risks two audible bugs:
-    /// (a) phonemes past L=400 silently get truncated; (b) audio past
-    /// N=1024 frames triggers the overflow-trim in speakOneChunk, which
-    /// squeezes trailing-phoneme durations and makes the tail race.
-    static func chunk(_ text: String, maxLen: Int = 200) -> [String] {
+    /// `maxLen` is a *character* ceiling. The default 280 is sized for
+    /// the CoreML backend, whose buckets top out at L=400 phonemes and
+    /// N=1024 audio frames (~12.8 s). English phonemizes at ~1.0–1.4
+    /// phonemes per char, so a 280-char chunk worst-cases at ~392
+    /// phonemes — within L=400 with a small margin. Going higher than
+    /// ~290 risks two audible bugs on CoreML: (a) phonemes past L=400
+    /// silently get truncated; (b) audio past N=1024 frames triggers
+    /// the overflow-trim in speakOneChunk, which squeezes
+    /// trailing-phoneme durations and makes the tail race.
+    ///
+    /// MLX and GGML allocate dynamically and have no bucket constraint
+    /// — they pass `maxLen: .max` so whole sentences stay as a single
+    /// chunk regardless of length. The last-resort `splitIfTooLong`
+    /// comma-split otherwise breaks mid-thought (e.g. "...prosody," /
+    /// "pitch, and timing.") and produces an audible pause inside the
+    /// sentence even with the inter-chunk gap suppressed.
+    static func chunk(_ text: String, maxLen: Int = 280) -> [String] {
         var chunks: [String] = []
         for paragraph in text.components(separatedBy: "\n\n") {
             let para = paragraph.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -415,14 +437,20 @@ struct TextChunker {
         return chunks
     }
 
-    /// Split on .!?;: while keeping the terminal punctuation with the
-    /// sentence. Sentences that somehow exceed `maxLen` are split on commas
-    /// / spaces to stay within the model's L=400 phoneme bucket.
+    /// Split on .!? while keeping the terminal punctuation with the
+    /// sentence. We deliberately do NOT split on `;:` — those mark
+    /// sub-clause boundaries inside one thought, and breaking there
+    /// causes audible pauses (every chunk boundary scheduled an
+    /// inter-sentence gap and risked an audio-thread underrun on the
+    /// transition). Sub-clause punctuation is left embedded in the
+    /// chunk so the LSTM duration head can render it as natural
+    /// prosody. Sentences that somehow exceed `maxLen` are split on
+    /// commas / spaces to stay within the model's L=400 phoneme bucket.
     private static func splitSentences(_ text: String, maxLen: Int) -> [String] {
         var out: [String] = []
         let chars = Array(text)
         var start = chars.startIndex
-        let enders: Set<Character> = [".", "!", "?", ";", ":"]
+        let enders: Set<Character> = [".", "!", "?"]
 
         var i = chars.startIndex
         while i < chars.endIndex {

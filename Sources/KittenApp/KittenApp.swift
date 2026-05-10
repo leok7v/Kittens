@@ -131,12 +131,35 @@ struct LogEntry: Identifiable {
 final class MetricsLog: ObservableObject {
     @Published var entries: [LogEntry] = []
     @Published var ramMB: Double = 0
+    /// Running average RTF for the current Speak: total audio produced
+    /// divided by wall-clock since `beginSpeak()`. Per-chunk RTF is
+    /// misleading with the depth-1 prefetch — chunk N+1's "totalMs"
+    /// includes time blocked on the inferLock waiting for chunk N — so
+    /// we report the throughput across the whole utterance instead.
+    /// 0 = no speak yet (or hasn't produced any audio).
+    @Published var avgRTF: Double = 0
+    private var speakStartTime: Date?
+    private var speakTotalAudioS: Double = 0
 
     func info(_ s: String) { append(.init(time: Date(), text: s, kind: .info)) }
     func metric(_ s: String) { append(.init(time: Date(), text: s, kind: .metric)) }
     func warn(_ s: String) { append(.init(time: Date(), text: s, kind: .warn)) }
 
     func updateRAM() { ramMB = KittenMetrics.residentMB() }
+
+    func beginSpeak() {
+        speakStartTime = Date()
+        speakTotalAudioS = 0
+        avgRTF = 0
+    }
+
+    func recordChunkAudio(_ audioS: Double) {
+        speakTotalAudioS += audioS
+        if let start = speakStartTime {
+            let elapsed = Date().timeIntervalSince(start)
+            if elapsed > 0 { avgRTF = speakTotalAudioS / elapsed }
+        }
+    }
 
     private func append(_ e: LogEntry) {
         entries.append(e)
@@ -364,6 +387,15 @@ struct KittenTTSView: View {
 
                     Spacer()
 
+                    if log.avgRTF > 0 {
+                        // Running average across the current Speak —
+                        // audio produced / wall-clock since start.
+                        // > 1 = faster than realtime; < 1 means inference can't
+                        // keep up with playback and audio will stutter.
+                        Text(String(format: "RTF %.1f×", log.avgRTF))
+                            .font(.caption.monospaced())
+                            .foregroundColor(log.avgRTF < 1.0 ? .orange : .secondary)
+                    }
                     Text(String(format: "RAM %.0f MB", log.ramMB))
                         .font(.caption.monospaced())
                         .foregroundColor(.secondary)
@@ -498,6 +530,7 @@ struct KittenTTSView: View {
             let rtf = audioS / (totalMs / 1000.0)
             let tag = "\(m.variant.rawValue)/\(m.compute.rawValue)"
             Task { @MainActor in
+                log?.recordChunkAudio(audioS)
                 log?.metric(String(format:
                     "CoreML/\(tag) chunk  phonemes=%d L=%d N=%d  text %.0fms gen %.0fms  audio %.2fs  RTF %.1fx",
                     m.phonemes, m.bucketL, m.bucketN,
@@ -508,6 +541,7 @@ struct KittenTTSView: View {
             let audioS = Double(m.samples) / 24000.0
             let rtf = audioS / (m.elapsedMs / 1000.0)
             Task { @MainActor in
+                log?.recordChunkAudio(audioS)
                 log?.metric(String(format:
                     "MLX    chunk   phonemes=%d                 elapsed %.0fms  audio %.2fs  RTF %.1fx",
                     m.phonemes, m.elapsedMs, audioS, rtf))
@@ -518,6 +552,7 @@ struct KittenTTSView: View {
             let audioS = Double(m.samples) / 24000.0
             let rtf = audioS / (m.totalMs / 1000.0)
             Task { @MainActor in
+                log?.recordChunkAudio(audioS)
                 log?.metric(String(format:
                     "GGML   chunk   phonemes=%d frames=%d         total %.0fms  audio %.2fs  RTF %.1fx",
                     m.phonemes, m.frames, m.totalMs, audioS, rtf))
@@ -634,6 +669,7 @@ struct KittenTTSView: View {
         isGenerating = true
         let tag = "\(voice) / \(backend.rawValue)"
         status = "Speaking [\(tag)]..."
+        log.beginSpeak()
         player.stop()
         // Every Speak gets a fresh generation id. Chunks scheduled AFTER a
         // subsequent stop() (either by the user or by another Speak) will

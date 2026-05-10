@@ -55,6 +55,12 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
     private var ctx: OpaquePointer?       // kt_ctx *
     private var voiceEmbeds: [String: [Float]] = [:]   // flattened 400*256
     private let loadLock = OSAllocatedUnfairLock()
+    /// Serialises kt_synthesize calls. The C API is single-threaded per ctx
+    /// (see KittensGGML.h). The depth-1 prefetch in `speak` spawns chunk
+    /// N+1's task while chunk N is still inferring — without this lock the
+    /// two would race on shared ggml backend buffers (manifests as
+    /// EXC_BAD_ACCESS / objc_msgSend corruption on iOS).
+    private let inferLock = NSLock()
 
     public static var voiceAliases: [String: String] { KittenTTS.voiceAliases }
     public static var voiceDisplayOrder: [String] { KittenTTS.voiceDisplayOrder }
@@ -118,20 +124,60 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
 
         let effectiveSpeed = config.speed * (KittenTTS.speedPriors[voiceID] ?? 1.0)
         let normalised = TextPreprocessor.process(text)
-        let chunks = TextChunker.chunk(normalised)
+        // GGML allocates buffers dynamically — no L=400 bucket like
+        // CoreML. Pass `.max` so the chunker only breaks on `.!?` and
+        // never on commas; whole sentences stay together regardless of
+        // length. Eliminates the mid-sentence comma-split pause.
+        let chunks = TextChunker.chunk(normalised, maxLen: .max)
+        if chunks.isEmpty { return [] }
         var allAudio: [Float] = []
 
-        // ~120 ms inter-sentence silence (matches CoreML backend).
+        // 120 ms inter-sentence silence — only between true sentence
+        // breaks (prev chunk ends in `.!?`). The chunker no longer
+        // splits on `;:`, so sub-clauses stay inside one chunk and
+        // the listener doesn't hear an unexpected pause mid-thought.
         let gap = [Float](repeating: 0, count: Int(0.12 * 24000))
+        func gapAfter(_ prev: String) -> [Float] {
+            guard let last = prev.last else { return [] }
+            return (last == "." || last == "!" || last == "?") ? gap : []
+        }
 
-        for (idx, chunk) in chunks.enumerated() {
-            let phonemes = try Phonemizer.phonemize(chunk)
-            let refId = min(chunk.count, 399)
+        // Depth-1 prefetch:
+        //
+        //   sequential:    [phonemize_N][synthesize_N][cb_N][phonemize_{N+1}]...
+        //   prefetched:    [phonemize_N][synthesize_N+cb_N + phonemize_{N+1}+spawn_{N+1}]...
+        //
+        // Phonemize and the cb dispatch run on the foreground task's thread;
+        // synthesize runs on a detached background task. We spawn task_{N+1}
+        // BEFORE awaiting task_N, so by the time we emit chunk N, chunk N+1's
+        // synthesize is already underway. Phonemize_{N+1} and the cb for N
+        // overlap with synthesize_{N+1} starting up.
+        //
+        // NOTE: kt_synthesize is single-threaded per ctx, so two concurrent
+        // synthesizes on the same ctx would race. Tasks are scheduled with
+        // a serialised infer queue so they run in order; the depth-1 lookahead
+        // doesn't add inference parallelism, just hides phonemize + cb cost.
+        // For real parallelism (RTF ≈ 1 hardware), we'd need a second ctx —
+        // costs an extra 35 MB of model weights but lets two synthesizes run
+        // simultaneously.
+        let speed = effectiveSpeed
+        let speakSelf = self
+        func taskFor(_ chunkText: String) -> Task<[Float], Error> {
+            let phonemes = (try? Phonemizer.phonemize(chunkText)) ?? []
+            let refId = min(chunkText.count, 399)
             let style = Array(voiceRows[(refId * 256)..<((refId + 1) * 256)])
+            return Task.detached(priority: .userInitiated) {
+                try speakSelf.synthesizeChunk(phonemes: phonemes, style: style, speed: speed)
+            }
+        }
 
-            let audio = try synthesizeChunk(phonemes: phonemes, style: style,
-                                            speed: effectiveSpeed)
-            let emit: [Float] = idx == 0 ? audio : gap + audio
+        // Kick off chunk[0] before the loop; each iter spawns chunk[idx+1].
+        var pendingTask: Task<[Float], Error>? = taskFor(chunks[0])
+        for idx in chunks.indices {
+            guard let task = pendingTask else { break }
+            pendingTask = (idx + 1 < chunks.count) ? taskFor(chunks[idx + 1]) : nil
+            let audio = try await task.value
+            let emit: [Float] = idx == 0 ? audio : gapAfter(chunks[idx - 1]) + audio
             if let cb = callback {
                 let int16 = emit.map { Int16(clamping: Int(($0 * 32767.0).rounded())) }
                 int16.withUnsafeBufferPointer { buf in
@@ -154,6 +200,8 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
 
         let ids32: [Int32] = phonemes.map { Int32($0) }
         let t0 = Date()
+        // Serialise — see inferLock doc comment.
+        inferLock.lock()
         let audio: kt_audio = ids32.withUnsafeBufferPointer { idsBuf in
             style.withUnsafeBufferPointer { styBuf in
                 kt_synthesize(c,
@@ -161,6 +209,7 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
                               styBuf.baseAddress, speed)
             }
         }
+        inferLock.unlock()
         let elapsedMs = Date().timeIntervalSince(t0) * 1000.0
 
         guard let samples = audio.samples, audio.n_samples > 0 else {
